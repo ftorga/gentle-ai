@@ -1454,6 +1454,118 @@ func TestCompactBehavioralEvidenceBindsV3ReceiptAndPreservesV2Reads(t *testing.T
 	}
 }
 
+func TestCompactCorrectionAtomicallyReplacesBehavioralEvidence(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "base\nwrong\n")
+	state := newCompactTestState(t, repo, "behavioral-evidence-correction")
+	original := BehavioralEvidence{
+		Schema: BehavioralEvidenceSchema, Applicability: BehavioralEvidenceActivated,
+		CandidateTree: state.CurrentSnapshot.CandidateTree, PathsDigest: state.CurrentSnapshot.PathsDigest,
+		Obligations: []BehavioralObligation{{ID: "wrong-value", OutcomeOrInvariant: "stored value is correct", ProofRefs: []string{"candidate-only test"}, Disposition: "proved"}},
+	}
+	if err := state.BindBehavioralEvidence(original); err != nil {
+		t.Fatal(err)
+	}
+	finding := Finding{ID: "R3-001", Lens: strings.TrimPrefix(LensReliability, "review-"), Location: "tracked.txt:2", Severity: "CRITICAL", Claim: "wrong value", ProofRefs: []string{"candidate-only failure"}}
+	if err := state.CompleteReview(CompactReviewInput{LensResults: []LensResult{{Lens: LensReliability, Findings: []Finding{finding}, Evidence: []string{"reviewed"}}}, Classifications: []FindingEvidence{{FindingID: finding.ID, Class: EvidenceDeterministic, Causality: CausalIntroduced, Proof: "changed hunk"}}, RefuterOutcomes: []EvidenceResult{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginCorrection(1); err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, repo, "tracked.txt", "base\nfixed\n")
+	fix, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetFixDiff, BaseRef: state.CurrentSnapshot.CandidateTree, IntendedUntracked: state.InitialSnapshot.IntendedUntracked, LedgerIDs: state.FixFindingIDs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixHash := FixDeltaHashForSnapshot(fix)
+	validation := ScopedValidationResult{LedgerIDs: state.FixFindingIDs, FixCausedFindings: []Finding{}, FollowUps: []FollowUp{}, OriginalCriteria: ValidationCheck{EvidenceHash: hash("2"), FixDeltaHash: fixHash, Passed: true}, CorrectionRegression: ValidationCheck{EvidenceHash: hash("3"), FixDeltaHash: fixHash, Passed: true}}
+	replacement := original
+	replacement.CandidateTree, replacement.PathsDigest = fix.CandidateTree, fix.PathsDigest
+	replacement.Obligations[0].ProofRefs = []string{"correction regression test"}
+	if err := state.CompleteCorrectionWithBehavioralEvidence(fix, 1, validation, replacement); err != nil {
+		t.Fatalf("CompleteCorrectionWithBehavioralEvidence() error = %v", err)
+	}
+	if state.State != StateValidating || state.BehavioralEvidence == nil || state.BehavioralEvidence.CandidateTree != fix.CandidateTree || state.BehavioralEvidence.Obligations[0].ProofRefs[0] != "correction regression test" {
+		t.Fatalf("correction evidence = %#v", state)
+	}
+
+	before := state
+	stale := replacement
+	stale.CandidateTree = original.CandidateTree
+	if err := state.BindBehavioralEvidence(stale); err == nil || !reflect.DeepEqual(state, before) {
+		t.Fatalf("post-correction evidence mutation = %#v, %v", state, err)
+	}
+}
+
+func TestCompactCorrectionRejectsRetainedBehavioralEvidenceWithoutReplacement(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "base\nwrong\n")
+	state := newCompactTestState(t, repo, "behavioral-evidence-retained")
+	evidence := BehavioralEvidence{
+		Schema: BehavioralEvidenceSchema, Applicability: BehavioralEvidenceActivated,
+		CandidateTree: state.CurrentSnapshot.CandidateTree, PathsDigest: state.CurrentSnapshot.PathsDigest,
+		Obligations: []BehavioralObligation{{ID: "wrong-value", OutcomeOrInvariant: "stored value is correct", ProofRefs: []string{"candidate-only test"}, Disposition: "proved"}},
+	}
+	if err := state.BindBehavioralEvidence(evidence); err != nil {
+		t.Fatal(err)
+	}
+	finding := Finding{ID: "R3-001", Lens: strings.TrimPrefix(LensReliability, "review-"), Location: "tracked.txt:2", Severity: "CRITICAL", Claim: "wrong value", ProofRefs: []string{"candidate-only failure"}}
+	if err := state.CompleteReview(CompactReviewInput{LensResults: []LensResult{{Lens: LensReliability, Findings: []Finding{finding}, Evidence: []string{"reviewed"}}}, Classifications: []FindingEvidence{{FindingID: finding.ID, Class: EvidenceDeterministic, Causality: CausalIntroduced, Proof: "changed hunk"}}, RefuterOutcomes: []EvidenceResult{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginCorrection(1); err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, repo, "tracked.txt", "base\nfixed\n")
+	fix, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetFixDiff, BaseRef: state.CurrentSnapshot.CandidateTree, IntendedUntracked: state.InitialSnapshot.IntendedUntracked, LedgerIDs: state.FixFindingIDs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixHash := FixDeltaHashForSnapshot(fix)
+	validation := ScopedValidationResult{LedgerIDs: state.FixFindingIDs, FixCausedFindings: []Finding{}, FollowUps: []FollowUp{}, OriginalCriteria: ValidationCheck{EvidenceHash: hash("2"), FixDeltaHash: fixHash, Passed: true}, CorrectionRegression: ValidationCheck{EvidenceHash: hash("3"), FixDeltaHash: fixHash, Passed: true}}
+	before := state
+	if err := state.CompleteCorrection(fix, 1, validation); err == nil || !strings.Contains(err.Error(), "replacement behavioral evidence") {
+		t.Fatalf("CompleteCorrection() error = %v, want replacement evidence rejection", err)
+	}
+	if !reflect.DeepEqual(state, before) {
+		t.Fatalf("rejected retained evidence correction mutated state:\nbefore=%#v\nafter=%#v", before, state)
+	}
+}
+
+func TestCompactReviewR3MaterialOmissionUsesExistingCorrectionLedger(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		severity   string
+		wantState  State
+		wantFixIDs []string
+	}{
+		{name: "candidate-causal critical omission blocks", severity: "CRITICAL", wantState: StateCorrectionRequired, wantFixIDs: []string{"R3-001"}},
+		{name: "warning remains a non-blocking follow-up", severity: "WARNING", wantState: StateValidating, wantFixIDs: []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+			state := newCompactTestState(t, repo, "r3-behavioral-"+strings.ReplaceAll(tt.name, " ", "-"))
+			finding := Finding{ID: "R3-001", Lens: strings.TrimPrefix(LensReliability, "review-"), Location: "tracked.txt:1", Severity: tt.severity, Claim: "material outcome lacks proof", ProofRefs: []string{"R3 confirmation"}}
+			classifications := []FindingEvidence{}
+			if tt.severity == "CRITICAL" {
+				classifications = append(classifications, FindingEvidence{FindingID: finding.ID, Class: EvidenceDeterministic, Causality: CausalIntroduced, Proof: "candidate-caused omission"})
+			}
+			if err := state.CompleteReview(CompactReviewInput{
+				LensResults:     []LensResult{{Lens: LensReliability, Findings: []Finding{finding}, Evidence: []string{"reviewed"}}},
+				Classifications: classifications,
+				RefuterOutcomes: []EvidenceResult{},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if state.State != tt.wantState || !reflect.DeepEqual(state.FixFindingIDs, tt.wantFixIDs) {
+				t.Fatalf("R3 review state=%q fixIDs=%v, want %q/%v", state.State, state.FixFindingIDs, tt.wantState, tt.wantFixIDs)
+			}
+		})
+	}
+}
+
 func newCompactTestStateWithIntended(t *testing.T, repo, lineage string, intended []string) CompactState {
 	t.Helper()
 	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: intended})

@@ -637,6 +637,25 @@ func (state *CompactState) BeginCorrection(proposed int) error {
 }
 
 func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, validation ScopedValidationResult) error {
+	if state.BehavioralEvidence != nil {
+		return errors.New("corrected compact candidate requires replacement behavioral evidence")
+	}
+	return state.completeCorrection(snapshot, actual, validation, nil)
+}
+
+// CompleteCorrectionWithBehavioralEvidence atomically binds replacement evidence to a corrected candidate.
+func (state *CompactState) CompleteCorrectionWithBehavioralEvidence(snapshot Snapshot, actual int, validation ScopedValidationResult, evidence BehavioralEvidence) error {
+	canonical, err := CanonicalBehavioralEvidence(evidence)
+	if err != nil {
+		return err
+	}
+	if canonical.CandidateTree != snapshot.CandidateTree || canonical.PathsDigest != snapshot.PathsDigest {
+		return errors.New("behavioral evidence does not bind the corrected compact candidate")
+	}
+	return state.completeCorrection(snapshot, actual, validation, &canonical)
+}
+
+func (state *CompactState) completeCorrection(snapshot Snapshot, actual int, validation ScopedValidationResult, behavioralEvidence *BehavioralEvidence) error {
 	if state.State != StateCorrectionRequired || state.ProposedCorrectionLines == nil {
 		return fmt.Errorf("cannot complete correction from compact state %q", state.State)
 	}
@@ -664,6 +683,7 @@ func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, val
 	state.CorrectionAttempts = append(state.CorrectionAttempts, attempt)
 	state.CumulativeCorrectionLines += actual
 	state.CurrentSnapshot = snapshot
+	state.BehavioralEvidence = behavioralEvidence
 	state.FollowUps = append(state.FollowUps, validation.FollowUps...)
 	if state.CumulativeCorrectionLines > state.CorrectionBudget {
 		state.FixDeltaHash, state.ActualCorrectionLines = fixHash, &actual
@@ -688,8 +708,8 @@ func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, val
 }
 
 func (state *CompactState) BindBehavioralEvidence(evidence BehavioralEvidence) error {
-	if state.State == StateApproved || state.State == StateEscalated {
-		return errors.New("cannot bind behavioral evidence after terminal compact review")
+	if state.State != StateReviewing {
+		return errors.New("behavioral evidence may only be bound while the compact review is reviewing")
 	}
 	canonical, err := CanonicalBehavioralEvidence(evidence)
 	if err != nil {
