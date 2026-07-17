@@ -243,7 +243,7 @@ func applyReviewGate(
 		}
 	}
 	var evaluation reviewtransaction.NativeGateEvaluation
-	if reviewtransaction.CompactReceiptSchemaOf(receiptPayload) == reviewtransaction.CompactReceiptSchema {
+	if schema := reviewtransaction.CompactReceiptSchemaOf(receiptPayload); schema == reviewtransaction.CompactReceiptSchema || schema == reviewtransaction.CompactReceiptSchemaV3 {
 		receipt, err := reviewtransaction.ParseCompactReceipt(receiptPayload)
 		if err != nil {
 			blockReviewGate(status, reviewtransaction.GateInvalidated, fmt.Sprintf("compact review receipt is invalid or non-terminal: %v", err))

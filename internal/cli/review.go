@@ -407,7 +407,7 @@ func RunReviewValidate(args []string, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("read review receipt: %w", err)
 	}
-	if reviewtransaction.CompactReceiptSchemaOf(receiptPayload) == reviewtransaction.CompactReceiptSchema {
+	if schema := reviewtransaction.CompactReceiptSchemaOf(receiptPayload); schema == reviewtransaction.CompactReceiptSchema || schema == reviewtransaction.CompactReceiptSchemaV3 {
 		if strings.TrimSpace(*requestPath) != "" {
 			return errors.New("compact review receipts require native authority flags")
 		}

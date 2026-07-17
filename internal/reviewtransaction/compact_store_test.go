@@ -1407,6 +1407,53 @@ func newCompactTestState(t *testing.T, repo, lineage string) CompactState {
 	return newCompactTestStateWithIntended(t, repo, lineage, []string{})
 }
 
+func TestCompactBehavioralEvidenceBindsV3ReceiptAndPreservesV2Reads(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	state := newCompactTestState(t, repo, "behavioral-evidence")
+	evidence := BehavioralEvidence{Schema: BehavioralEvidenceSchema, Applicability: BehavioralEvidenceActivated,
+		CandidateTree: state.CurrentSnapshot.CandidateTree, PathsDigest: state.CurrentSnapshot.PathsDigest,
+		Obligations: []BehavioralObligation{{ID: "persisted-outcome", OutcomeOrInvariant: "candidate outcome persists", ProofRefs: []string{"focused test"}, Disposition: "proved"}}}
+	if err := state.BindBehavioralEvidence(evidence); err != nil {
+		t.Fatal(err)
+	}
+	state.State, state.EvidenceHash = StateApproved, hash("2")
+	receipt, err := state.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Schema != CompactReceiptSchemaV3 || receipt.BehavioralEvidenceDigest != BehavioralEvidenceDigest(evidence) || receipt.BehavioralEvidenceApplicability != BehavioralEvidenceActivated {
+		t.Fatalf("v3 receipt binding = %#v", receipt)
+	}
+
+	legacy := receipt
+	legacy.Schema, legacy.BehavioralEvidenceDigest, legacy.BehavioralEvidenceApplicability = CompactReceiptSchema, "", ""
+	payload, _ := json.Marshal(legacy)
+	if parsed, err := ParseCompactReceipt(payload); err != nil || parsed.Schema != CompactReceiptSchema {
+		t.Fatalf("v2 receipt = %#v, %v", parsed, err)
+	}
+	malformed := receipt
+	malformed.BehavioralEvidenceDigest = ""
+	if payload, err := json.Marshal(malformed); err != nil {
+		t.Fatal(err)
+	} else if _, err := ParseCompactReceipt(payload); err == nil {
+		t.Fatal("ParseCompactReceipt() accepted a malformed v3 behavioral binding")
+	}
+
+	evidence.CandidateTree = tree("f")
+	if err := state.BindBehavioralEvidence(evidence); err == nil {
+		t.Fatal("BindBehavioralEvidence() accepted stale candidate binding")
+	}
+
+	nonApplicable := newCompactTestState(t, repo, "behavioral-evidence-na")
+	if err := nonApplicable.BindBehavioralEvidence(BehavioralEvidence{Schema: BehavioralEvidenceSchema, Applicability: BehavioralEvidenceNonApplicable, Basis: "documentation only", CandidateTree: nonApplicable.CurrentSnapshot.CandidateTree, PathsDigest: nonApplicable.CurrentSnapshot.PathsDigest, Obligations: []BehavioralObligation{}}); err != nil {
+		t.Fatal(err)
+	}
+	nonApplicable.State, nonApplicable.EvidenceHash = StateApproved, hash("3")
+	if receipt, err := nonApplicable.Receipt(); err != nil || receipt.BehavioralEvidenceApplicability != BehavioralEvidenceNonApplicable {
+		t.Fatalf("non-applicable v3 receipt = %#v, %v", receipt, err)
+	}
+}
+
 func newCompactTestStateWithIntended(t *testing.T, repo, lineage string, intended []string) CompactState {
 	t.Helper()
 	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: intended})

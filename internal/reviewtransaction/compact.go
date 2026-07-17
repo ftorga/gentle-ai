@@ -16,6 +16,7 @@ import (
 
 const CompactStateSchema = "gentle-ai.review-state/v2"
 const CompactReceiptSchema = "gentle-ai.review-receipt/v2"
+const CompactReceiptSchemaV3 = "gentle-ai.review-receipt/v3"
 
 const (
 	StateCorrectionRequired      State = "correction_required"
@@ -52,6 +53,7 @@ type CompactState struct {
 	Recovery                  *CompactRecoveryProvenance `json:"recovery,omitempty"`
 	CorrectionAttempts        []CompactCorrectionAttempt `json:"correction_attempts,omitempty"`
 	CumulativeCorrectionLines int                        `json:"cumulative_correction_lines,omitempty"`
+	BehavioralEvidence        *BehavioralEvidence        `json:"behavioral_evidence,omitempty"`
 }
 
 type CompactCorrectionAttempt struct {
@@ -82,21 +84,23 @@ type CompactRecoveryProvenance struct {
 }
 
 type CompactReceipt struct {
-	Schema             string        `json:"schema"`
-	LineageID          string        `json:"lineage_id"`
-	Projection         Projection    `json:"projection,omitempty"`
-	Generation         int           `json:"generation"`
-	BaseTree           string        `json:"base_tree"`
-	InitialReviewTree  string        `json:"initial_review_tree"`
-	FinalCandidateTree string        `json:"final_candidate_tree"`
-	PathsDigest        string        `json:"paths_digest"`
-	FixDeltaHash       string        `json:"fix_delta_hash"`
-	PolicyHash         string        `json:"policy_hash"`
-	EvidenceHash       string        `json:"evidence_hash"`
-	RiskLevel          RiskLevel     `json:"risk_level"`
-	SelectedLenses     []string      `json:"selected_lenses"`
-	ResolvedFindingIDs []string      `json:"resolved_finding_ids"`
-	TerminalState      TerminalState `json:"terminal_state"`
+	Schema                          string                          `json:"schema"`
+	LineageID                       string                          `json:"lineage_id"`
+	Projection                      Projection                      `json:"projection,omitempty"`
+	Generation                      int                             `json:"generation"`
+	BaseTree                        string                          `json:"base_tree"`
+	InitialReviewTree               string                          `json:"initial_review_tree"`
+	FinalCandidateTree              string                          `json:"final_candidate_tree"`
+	PathsDigest                     string                          `json:"paths_digest"`
+	FixDeltaHash                    string                          `json:"fix_delta_hash"`
+	PolicyHash                      string                          `json:"policy_hash"`
+	EvidenceHash                    string                          `json:"evidence_hash"`
+	RiskLevel                       RiskLevel                       `json:"risk_level"`
+	SelectedLenses                  []string                        `json:"selected_lenses"`
+	ResolvedFindingIDs              []string                        `json:"resolved_finding_ids"`
+	BehavioralEvidenceDigest        string                          `json:"behavioral_evidence_digest,omitempty"`
+	BehavioralEvidenceApplicability BehavioralEvidenceApplicability `json:"behavioral_evidence_applicability,omitempty"`
+	TerminalState                   TerminalState                   `json:"terminal_state"`
 }
 
 type CompactReviewInput struct {
@@ -262,6 +266,12 @@ func (state CompactState) Validate() error {
 	case StateEscalated:
 	default:
 		return fmt.Errorf("invalid compact review state %q", state.State)
+	}
+	if state.BehavioralEvidence != nil {
+		canonical, err := CanonicalBehavioralEvidence(*state.BehavioralEvidence)
+		if err != nil || !reflect.DeepEqual(canonical, *state.BehavioralEvidence) || canonical.CandidateTree != state.CurrentSnapshot.CandidateTree || canonical.PathsDigest != state.CurrentSnapshot.PathsDigest {
+			return errors.New("compact behavioral evidence is invalid or stale")
+		}
 	}
 	return nil
 }
@@ -677,6 +687,21 @@ func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, val
 	return state.Validate()
 }
 
+func (state *CompactState) BindBehavioralEvidence(evidence BehavioralEvidence) error {
+	if state.State == StateApproved || state.State == StateEscalated {
+		return errors.New("cannot bind behavioral evidence after terminal compact review")
+	}
+	canonical, err := CanonicalBehavioralEvidence(evidence)
+	if err != nil {
+		return err
+	}
+	if canonical.CandidateTree != state.CurrentSnapshot.CandidateTree || canonical.PathsDigest != state.CurrentSnapshot.PathsDigest {
+		return errors.New("behavioral evidence does not bind the current compact candidate")
+	}
+	state.BehavioralEvidence = &canonical
+	return nil
+}
+
 func (state *CompactState) CompleteVerification(evidence []byte, approved bool) error {
 	if state.State != StateValidating {
 		return fmt.Errorf("cannot complete verification from compact state %q", state.State)
@@ -717,6 +742,11 @@ func (state CompactState) Receipt() (CompactReceipt, error) {
 		RiskLevel: state.RiskLevel, SelectedLenses: append([]string(nil), state.SelectedLenses...),
 		ResolvedFindingIDs: append([]string(nil), state.FixFindingIDs...), TerminalState: terminal,
 	}
+	if state.BehavioralEvidence != nil {
+		receipt.Schema = CompactReceiptSchemaV3
+		receipt.BehavioralEvidenceDigest = BehavioralEvidenceDigest(*state.BehavioralEvidence)
+		receipt.BehavioralEvidenceApplicability = state.BehavioralEvidence.Applicability
+	}
 	return receipt, receipt.Validate()
 }
 
@@ -725,7 +755,7 @@ func (receipt CompactReceipt) Validate() error {
 	if err != nil || projection != receipt.Projection {
 		return errors.New("compact receipt projection is unsupported or non-canonical")
 	}
-	if receipt.Schema != CompactReceiptSchema || validateLineageID(receipt.LineageID) != nil || receipt.Generation < 1 {
+	if (receipt.Schema != CompactReceiptSchema && receipt.Schema != CompactReceiptSchemaV3) || validateLineageID(receipt.LineageID) != nil || receipt.Generation < 1 {
 		return errors.New("invalid compact review receipt identity")
 	}
 	for _, tree := range []string{receipt.BaseTree, receipt.InitialReviewTree, receipt.FinalCandidateTree} {
@@ -747,6 +777,9 @@ func (receipt CompactReceipt) Validate() error {
 	}
 	if receipt.TerminalState != TerminalApproved && receipt.TerminalState != TerminalEscalated {
 		return errors.New("compact receipt terminal state is invalid")
+	}
+	if receipt.Schema == CompactReceiptSchemaV3 && (!validSHA256(receipt.BehavioralEvidenceDigest) || (receipt.BehavioralEvidenceApplicability != BehavioralEvidenceActivated && receipt.BehavioralEvidenceApplicability != BehavioralEvidenceNonApplicable)) {
+		return errors.New("v3 compact receipt behavioral evidence binding is invalid")
 	}
 	return nil
 }

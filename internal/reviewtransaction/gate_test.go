@@ -181,7 +181,7 @@ func TestPrePRGateRechecksMovingPublicationInputs(t *testing.T) {
 func TestExplicitPrePRRequestWithoutRemoteFailsClosed(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	baseCommit := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
-	gitSnapshot(t, repo, "branch", "main", baseCommit)
+	gitSnapshot(t, repo, "checkout", "-B", "main", baseCommit)
 	gitSnapshot(t, repo, "checkout", "-qb", "feature")
 	writeSnapshotFile(t, repo, "delivery.txt", "reviewed delivery\n")
 	gitSnapshot(t, repo, "add", "delivery.txt")
@@ -272,7 +272,7 @@ func TestSelectPrePRBoundaryUsesExactExplicitOrPublicationDefaultCommit(t *testi
 func TestDefaultBoundariesSeparatePrePRTargetFromPrePushTracking(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
-	gitSnapshot(t, repo, "branch", "main", base)
+	gitSnapshot(t, repo, "checkout", "-B", "main", base)
 	gitSnapshot(t, repo, "branch", "feature", base)
 	configurePublicationRemote(t, repo, "main")
 	gitSnapshot(t, repo, "checkout", "feature")
@@ -518,7 +518,7 @@ func TestPublicationTargetBindsAdvertisedUpstreamSeparatelyFromPushRemote(t *tes
 	upstream, origin := filepath.Join(t.TempDir(), "upstream.git"), filepath.Join(t.TempDir(), "origin.git")
 	gitSnapshot(t, repo, "clone", "--bare", repo, upstream)
 	gitSnapshot(t, repo, "clone", "--bare", repo, origin)
-	gitSnapshot(t, repo, "--git-dir", upstream, "branch", "main", base)
+	gitSnapshot(t, repo, "--git-dir", upstream, "branch", "-f", "main", base)
 	gitSnapshot(t, repo, "remote", "add", "upstream", upstream)
 	gitSnapshot(t, repo, "remote", "add", "origin", origin)
 	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "upstream")
@@ -547,7 +547,7 @@ func TestPublicationTargetBindsAdvertisedUpstreamSeparatelyFromPushRemote(t *tes
 	if err != nil || selection.Remote != "upstream" || selection.Commit != base {
 		t.Fatalf("explicit chained base = %#v, %v", selection, err)
 	}
-	gitSnapshot(t, repo, "--git-dir", origin, "branch", "main", base)
+	gitSnapshot(t, repo, "--git-dir", origin, "branch", "-f", "main", base)
 	if _, err := selectPrePRBoundary(context.Background(), repo, "main"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous explicit selector error = %v", err)
 	}
@@ -731,7 +731,7 @@ func newCompatiblePrePRFixtureMode(t *testing.T, deliveryPath, basePath string, 
 	t.Helper()
 	repo := initSnapshotRepo(t)
 	baseCommit := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
-	gitSnapshot(t, repo, "branch", "main", baseCommit)
+	gitSnapshot(t, repo, "checkout", "-B", "main", baseCommit)
 	remote := configurePublicationRemote(t, repo, "main")
 	gitSnapshot(t, repo, "checkout", "-qb", "feature")
 	gitSnapshot(t, repo, "config", "branch.feature.remote", "origin")
@@ -856,7 +856,7 @@ func (fixture *compatiblePrePRFixture) writeAttestation(t *testing.T) {
 func TestBuildNativeGateRequestDerivesAuthorityForEveryGate(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	branch := currentBranch(context.Background(), repo)
-	gitSnapshot(t, repo, "branch", "main", "HEAD")
+	gitSnapshot(t, repo, "checkout", "-B", "main", "HEAD")
 	configurePublicationRemote(t, repo, "main")
 	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
 	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/main")

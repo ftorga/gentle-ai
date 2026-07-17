@@ -16,6 +16,19 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
 )
 
+func TestReviewValidateDispatchesSupportedCompactReceiptSchemas(t *testing.T) {
+	for _, schema := range []string{reviewtransaction.CompactReceiptSchema, reviewtransaction.CompactReceiptSchemaV3} {
+		t.Run(schema, func(t *testing.T) {
+			receipt := filepath.Join(t.TempDir(), "receipt.json")
+			writeReviewCLIJSON(t, receipt, map[string]any{"schema": schema})
+			err := RunReviewValidate([]string{"--cwd", t.TempDir(), "--receipt", receipt}, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "parse compact review receipt") {
+				t.Fatalf("review-validate error = %v, want compact receipt validation", err)
+			}
+		})
+	}
+}
+
 func TestFlatReviewStartRejectsBeforeCreatingLegacyAuthority(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	policy := filepath.Join(t.TempDir(), "policy.md")

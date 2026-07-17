@@ -14,6 +14,18 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
 )
 
+func TestApplyReviewGateDispatchesSupportedCompactReceiptSchemas(t *testing.T) {
+	for _, schema := range []string{reviewtransaction.CompactReceiptSchema, reviewtransaction.CompactReceiptSchemaV3} {
+		t.Run(schema, func(t *testing.T) {
+			status := Status{Dependencies: Dependencies{Verify: DependencyAllDone}, TaskProgress: TaskProgress{AllComplete: true}}
+			applyReviewGate(&status, t.TempDir(), "", fmt.Sprintf(`{"schema":%q}`, schema))
+			if status.ReviewGate == nil || !strings.Contains(status.ReviewGate.Reason, "compact review receipt is invalid") {
+				t.Fatalf("review gate = %#v, want compact receipt validation", status.ReviewGate)
+			}
+		})
+	}
+}
+
 func TestResolveArchiveRequiresApprovedExactReviewReceipt(t *testing.T) {
 	tests := []struct {
 		name        string
