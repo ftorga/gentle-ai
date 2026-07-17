@@ -877,7 +877,7 @@ func writeApprovedCompactAuthorityForChange(t *testing.T, repo, changeRoot, line
 	writeApprovedCompactAuthorityForChangeWithTasks(t, repo, changeRoot, lineage, "- [x] 1.1 Done\n# approved compact scope\n")
 }
 
-func writeApprovedCompactAuthorityForChangeWithTasks(t *testing.T, repo, changeRoot, lineage, tasks string) {
+func writeApprovedCompactAuthorityForChangeWithTasks(t *testing.T, repo, changeRoot, lineage, tasks string, behavioralEvidence ...bool) {
 	t.Helper()
 	runSDDStatusGit(t, repo, "init", "-q")
 	runSDDStatusGit(t, repo, "config", "user.email", "status@example.com")
@@ -902,6 +902,16 @@ func writeApprovedCompactAuthorityForChangeWithTasks(t *testing.T, repo, changeR
 	state, err := reviewtransaction.NewCompactState(reviewtransaction.Start{LineageID: lineage, Mode: reviewtransaction.ModeOrdinaryBounded, Generation: 1, Snapshot: snapshot, PolicyHash: shaID("c"), RiskLevel: risk, SelectedLenses: lenses, OriginalChangedLines: &lines})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(behavioralEvidence) > 0 && behavioralEvidence[0] {
+		evidence := reviewtransaction.BehavioralEvidence{
+			Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: reviewtransaction.BehavioralEvidenceNonApplicable,
+			Basis: "receipt binding audit fixture", CandidateTree: state.CurrentSnapshot.CandidateTree, PathsDigest: state.CurrentSnapshot.PathsDigest,
+			Obligations: []reviewtransaction.BehavioralObligation{},
+		}
+		if err := state.BindBehavioralEvidence(evidence); err != nil {
+			t.Fatal(err)
+		}
 	}
 	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, lineage)
 	if err != nil {

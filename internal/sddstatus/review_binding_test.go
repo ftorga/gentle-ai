@@ -55,6 +55,40 @@ func TestBindApprovedReviewCASAndLiveEvidence(t *testing.T) {
 	}
 }
 
+func TestBindApprovedReviewAuditsV3BehavioralReceiptWithoutReplacingAuthority(t *testing.T) {
+	root := t.TempDir()
+	changeRoot := seedReadyChange(t, root, "thin", "- [x] 1.1 Done\n")
+	writeApprovedCompactAuthorityForChangeWithTasks(t, root, changeRoot, "approved-v3", "- [x] 1.1 Done\n# approved compact scope\n", true)
+
+	binding, err := BindApprovedReview(context.Background(), root, "thin", "approved-v3", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), root, "approved-v3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil || record.State.BehavioralEvidence == nil {
+		t.Fatalf("authoritative behavioral evidence = %#v, %v", record.State.BehavioralEvidence, err)
+	}
+	payload, err := os.ReadFile(store.ReceiptPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := reviewtransaction.ParseCompactReceipt(payload)
+	if err != nil || receipt.Schema != reviewtransaction.CompactReceiptSchemaV3 {
+		t.Fatalf("v3 receipt = %#v, %v", receipt, err)
+	}
+	if _, _, err := validateBoundReview(context.Background(), root, "thin"); err != nil {
+		t.Fatalf("validateBoundReview(v3) error = %v", err)
+	}
+	retry, err := BindApprovedReview(context.Background(), root, "thin", "approved-v3", binding.Revision)
+	if err != nil || retry.Revision != binding.Revision || retry.ReceiptHash != binding.ReceiptHash {
+		t.Fatalf("sequential v3 binding retry = %#v, %v", retry, err)
+	}
+}
+
 func TestBindApprovedReviewUsesNestedOpenSpecPlanningWorkspace(t *testing.T) {
 	root := t.TempDir()
 	planningRoot := filepath.Join(root, "packages", "app")

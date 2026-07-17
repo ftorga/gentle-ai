@@ -21,12 +21,13 @@ const (
 )
 
 type ReviewValidateResult struct {
-	Schema  string                        `json:"schema"`
-	Result  reviewtransaction.GateResult  `json:"result"`
-	Allowed bool                          `json:"allowed"`
-	Action  string                        `json:"action"`
-	Reason  string                        `json:"reason"`
-	Context reviewtransaction.GateContext `json:"context"`
+	Schema                    string                        `json:"schema"`
+	Result                    reviewtransaction.GateResult  `json:"result"`
+	Allowed                   bool                          `json:"allowed"`
+	Action                    string                        `json:"action"`
+	Reason                    string                        `json:"reason"`
+	Context                   reviewtransaction.GateContext `json:"context"`
+	BehavioralEvidenceWarning string                        `json:"behavioral_evidence_warning,omitempty"`
 }
 
 func newReviewFlagSet(name string, stdout io.Writer, details string) *flag.FlagSet {

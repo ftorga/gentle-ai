@@ -488,7 +488,7 @@ func TestReviewFacadeDeniedGateRetainsObservedBoundaryWithoutAuthorizing(t *test
 			Denial: &reviewtransaction.GateDenial{Stage: "boundary-selection", Code: "unavailable"},
 		},
 	}
-	if err := emitFacadeGateEvaluation(&output, evaluation); err == nil {
+	if err := emitFacadeGateEvaluation(&output, evaluation, ""); err == nil {
 		t.Fatal("denied gate returned success")
 	}
 	var result ReviewValidateResult
@@ -656,6 +656,269 @@ func TestReviewFacadeCorrectionFlowResumesFromEachCompactIntermediateState(t *te
 	if committedReuse.Action != "reuse-receipt" || committedReuse.LensesRequired || committedReuse.LineageID != started.LineageID || committedReuse.State != reviewtransaction.StateApproved {
 		t.Fatalf("equivalent committed corrected target did not reuse receipt: %#v", committedReuse)
 	}
+}
+
+func TestReviewFacadeBehavioralEvidenceInputAndReceiptVisibility(t *testing.T) {
+	t.Run("rejects malformed and stale input without changing authority", func(t *testing.T) {
+		repo := initReviewCLIRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate behavior\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		started := startFacadeReview(t, repo)
+		store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		malformed := filepath.Join(t.TempDir(), "malformed.json")
+		if err := os.WriteFile(malformed, []byte(`{"schema":"unknown"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--behavioral-evidence", malformed}, io.Discard); err == nil || !strings.Contains(err.Error(), "read behavioral evidence") {
+			t.Fatalf("malformed behavioral evidence error = %v", err)
+		}
+		afterMalformed, err := store.Load()
+		if err != nil || afterMalformed.Revision != before.Revision {
+			t.Fatalf("malformed input changed authority = %#v, %v", afterMalformed, err)
+		}
+
+		stale := reviewtransaction.BehavioralEvidence{
+			Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: reviewtransaction.BehavioralEvidenceNonApplicable,
+			Basis: "behavior preserving", CandidateTree: strings.Repeat("0", 40), PathsDigest: before.State.CurrentSnapshot.PathsDigest,
+			Obligations: []reviewtransaction.BehavioralObligation{},
+		}
+		stalePath := filepath.Join(t.TempDir(), "stale.json")
+		writeReviewCLIJSON(t, stalePath, stale)
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--behavioral-evidence", stalePath}, io.Discard); err == nil || !strings.Contains(err.Error(), "stale") {
+			t.Fatalf("stale behavioral evidence error = %v", err)
+		}
+		afterStale, err := store.Load()
+		if err != nil || afterStale.Revision != before.Revision {
+			t.Fatalf("stale input changed authority = %#v, %v", afterStale, err)
+		}
+	})
+
+	for _, applicability := range []reviewtransaction.BehavioralEvidenceApplicability{
+		reviewtransaction.BehavioralEvidenceActivated,
+		reviewtransaction.BehavioralEvidenceNonApplicable,
+	} {
+		t.Run(string(applicability), func(t *testing.T) {
+			repo := initReviewCLIRepo(t)
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate behavior\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			started := startFacadeReview(t, repo)
+			store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			evidence := reviewtransaction.BehavioralEvidence{
+				Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: applicability,
+				CandidateTree: record.State.CurrentSnapshot.CandidateTree, PathsDigest: record.State.CurrentSnapshot.PathsDigest,
+				Obligations: []reviewtransaction.BehavioralObligation{},
+			}
+			if applicability == reviewtransaction.BehavioralEvidenceActivated {
+				evidence.Obligations = []reviewtransaction.BehavioralObligation{{
+					ID: "OUTCOME-001", OutcomeOrInvariant: "review receipt exposes behavioral evidence", Disposition: "proved", ProofRefs: []string{"go test ./internal/cli"},
+				}}
+			} else {
+				evidence.Basis = "behavior preserving candidate"
+			}
+			evidencePath := filepath.Join(t.TempDir(), "behavioral-evidence.json")
+			writeReviewCLIJSON(t, evidencePath, evidence)
+			resultPath := filepath.Join(t.TempDir(), "review.json")
+			writeReviewCLIJSON(t, resultPath, facadeReviewerResult{Findings: []facadeFinding{}, Evidence: []string{"focused review completed"}})
+
+			var output bytes.Buffer
+			if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--result", resultPath, "--behavioral-evidence", evidencePath}, &output); err != nil {
+				t.Fatal(err)
+			}
+			if got := decodeFacadeFinalize(t, output.Bytes()); got.BehavioralEvidenceWarning != "" {
+				t.Fatalf("supplied behavioral evidence warning = %#v", got)
+			}
+			bound, err := store.Load()
+			if err != nil || bound.State.BehavioralEvidence == nil || bound.State.BehavioralEvidence.Applicability != applicability {
+				t.Fatalf("bound behavioral evidence = %#v, %v", bound, err)
+			}
+
+			finalEvidence := filepath.Join(t.TempDir(), "tests.txt")
+			if err := os.WriteFile(finalEvidence, []byte("go test ./...: pass\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			output.Reset()
+			if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--evidence", finalEvidence}, &output); err != nil {
+				t.Fatal(err)
+			}
+			receiptPayload, err := os.ReadFile(store.ReceiptPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := reviewtransaction.ParseCompactReceipt(receiptPayload)
+			if err != nil || receipt.BehavioralEvidenceApplicability != applicability || receipt.BehavioralEvidenceDigest == "" {
+				t.Fatalf("behavioral receipt = %#v, %v", receipt, err)
+			}
+		})
+	}
+
+	t.Run("missing evidence is visible warning metadata", func(t *testing.T) {
+		repo := initReviewCLIRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate behavior\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		startFacadeReview(t, repo)
+		resultPath := filepath.Join(t.TempDir(), "review.json")
+		writeReviewCLIJSON(t, resultPath, facadeReviewerResult{Findings: []facadeFinding{}, Evidence: []string{"focused review completed"}})
+		var output bytes.Buffer
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--result", resultPath}, &output); err != nil {
+			t.Fatal(err)
+		}
+		if got := decodeFacadeFinalize(t, output.Bytes()); got.BehavioralEvidenceWarning == "" {
+			t.Fatalf("missing behavioral evidence result = %#v", got)
+		}
+		finalEvidence := filepath.Join(t.TempDir(), "tests.txt")
+		if err := os.WriteFile(finalEvidence, []byte("go test ./...: pass\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--evidence", finalEvidence}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		output.Reset()
+		if err := RunReviewFacadeValidate([]string{"--cwd", repo, "--gate", string(reviewtransaction.GatePostApply)}, &output); err != nil {
+			t.Fatal(err)
+		}
+		var validation ReviewValidateResult
+		if err := json.Unmarshal(output.Bytes(), &validation); err != nil {
+			t.Fatal(err)
+		}
+		if validation.BehavioralEvidenceWarning == "" {
+			t.Fatalf("missing behavioral evidence validation = %#v", validation)
+		}
+	})
+}
+
+func TestReviewFacadeCorrectionReplacesBehavioralEvidenceAtomically(t *testing.T) {
+	newCorrection := func(t *testing.T) (string, reviewtransaction.CompactStore, string, string, reviewtransaction.BehavioralEvidence) {
+		t.Helper()
+		repo := initReviewCLIRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\none\ntwo\nthree\nfour\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		started := startFacadeReview(t, repo)
+		store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		initialEvidence := reviewtransaction.BehavioralEvidence{
+			Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: reviewtransaction.BehavioralEvidenceNonApplicable,
+			Basis: "initial candidate is behavior preserving", CandidateTree: record.State.CurrentSnapshot.CandidateTree,
+			PathsDigest: record.State.CurrentSnapshot.PathsDigest, Obligations: []reviewtransaction.BehavioralObligation{},
+		}
+		initialEvidencePath := filepath.Join(t.TempDir(), "initial-behavioral-evidence.json")
+		writeReviewCLIJSON(t, initialEvidencePath, initialEvidence)
+		resultPath := filepath.Join(t.TempDir(), "review.json")
+		writeReviewCLIJSON(t, resultPath, facadeReviewerResult{Findings: []facadeFinding{{
+			Location: "tracked.txt:5", Severity: "CRITICAL", Claim: "candidate returns the wrong terminal value",
+			ProofRefs: []string{"differential test passes on base and fails on candidate"}, EvidenceClass: reviewtransaction.EvidenceDeterministic,
+			CausalDisposition: reviewtransaction.CausalIntroduced,
+		}}, Evidence: []string{"focused differential test failed on candidate"}})
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--result", resultPath, "--behavioral-evidence", initialEvidencePath, "--correction-lines", "2"}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("base\none\ntwo\nthree\nfixed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		validationPath := filepath.Join(t.TempDir(), "validation.json")
+		writeReviewCLIJSON(t, validationPath, facadeValidationResult{
+			OriginalCriteria:     facadeValidationCheck{Passed: true, Evidence: []string{"original acceptance test passed"}},
+			CorrectionRegression: facadeValidationCheck{Passed: true, Evidence: []string{"targeted regression test passed"}},
+			FollowUps:            []reviewtransaction.FollowUp{},
+		})
+		return repo, store, validationPath, filepath.Join(t.TempDir(), "final-evidence.txt"), initialEvidence
+	}
+
+	t.Run("replacement reaches the v3 receipt", func(t *testing.T) {
+		repo, store, validationPath, finalEvidencePath, initialEvidence := newCorrection(t)
+		if err := os.WriteFile(finalEvidencePath, []byte("focused and full tests pass\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		current, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixSnapshot, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).Build(context.Background(), reviewtransaction.Target{
+			Kind: reviewtransaction.TargetFixDiff, Projection: current.State.InitialSnapshot.Projection,
+			BaseRef: current.State.CurrentSnapshot.CandidateTree, IntendedUntracked: current.State.InitialSnapshot.IntendedUntracked,
+			LedgerIDs: current.State.FixFindingIDs,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacement := reviewtransaction.BehavioralEvidence{
+			Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: reviewtransaction.BehavioralEvidenceActivated,
+			CandidateTree: fixSnapshot.CandidateTree, PathsDigest: fixSnapshot.PathsDigest,
+			Obligations: []reviewtransaction.BehavioralObligation{{ID: "OUTCOME-001", OutcomeOrInvariant: "corrected terminal value", Disposition: "proved", ProofRefs: []string{"go test ./internal/cli"}}},
+		}
+		replacementPath := filepath.Join(t.TempDir(), "replacement-behavioral-evidence.json")
+		writeReviewCLIJSON(t, replacementPath, replacement)
+
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--validation", validationPath, "--behavioral-evidence", replacementPath, "--evidence", finalEvidencePath}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		receiptPayload, err := os.ReadFile(store.ReceiptPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := reviewtransaction.ParseCompactReceipt(receiptPayload)
+		if err != nil || receipt.Schema != reviewtransaction.CompactReceiptSchemaV3 || receipt.BehavioralEvidenceDigest != reviewtransaction.BehavioralEvidenceDigest(replacement) || receipt.BehavioralEvidenceApplicability != replacement.Applicability {
+			t.Fatalf("replacement behavioral receipt = %#v, %v", receipt, err)
+		}
+		if receipt.BehavioralEvidenceDigest == reviewtransaction.BehavioralEvidenceDigest(initialEvidence) {
+			t.Fatalf("receipt retained initial evidence digest: %#v", receipt)
+		}
+	})
+
+	t.Run("rejected replacement does not mutate correction state", func(t *testing.T) {
+		repo, store, validationPath, _, _ := newCorrection(t)
+		before, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixSnapshot, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).Build(context.Background(), reviewtransaction.Target{
+			Kind: reviewtransaction.TargetFixDiff, Projection: before.State.InitialSnapshot.Projection,
+			BaseRef: before.State.CurrentSnapshot.CandidateTree, IntendedUntracked: before.State.InitialSnapshot.IntendedUntracked,
+			LedgerIDs: before.State.FixFindingIDs,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rejected := reviewtransaction.BehavioralEvidence{
+			Schema: reviewtransaction.BehavioralEvidenceSchema, Applicability: reviewtransaction.BehavioralEvidenceNonApplicable,
+			Basis: "stale replacement", CandidateTree: strings.Repeat("0", 40), PathsDigest: fixSnapshot.PathsDigest,
+			Obligations: []reviewtransaction.BehavioralObligation{},
+		}
+		rejectedPath := filepath.Join(t.TempDir(), "rejected-behavioral-evidence.json")
+		writeReviewCLIJSON(t, rejectedPath, rejected)
+
+		if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--validation", validationPath, "--behavioral-evidence", rejectedPath}, io.Discard); err == nil || !strings.Contains(err.Error(), "behavioral evidence") {
+			t.Fatalf("rejected replacement error = %v", err)
+		}
+		after, err := store.Load()
+		if err != nil || after.Revision != before.Revision || !reflect.DeepEqual(after.State, before.State) {
+			t.Fatalf("rejected replacement mutated authority: before=%#v after=%#v err=%v", before, after, err)
+		}
+	})
 }
 
 func TestReviewFacadePersistsOverBudgetForecastAndActual(t *testing.T) {

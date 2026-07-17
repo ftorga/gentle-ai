@@ -44,12 +44,13 @@ func facadeProjection(projection reviewtransaction.Projection) reviewtransaction
 }
 
 type ReviewFacadeFinalizeResult struct {
-	Operation     string                  `json:"operation"`
-	LineageID     string                  `json:"lineage_id"`
-	State         reviewtransaction.State `json:"state"`
-	Action        string                  `json:"action"`
-	StoreRevision string                  `json:"store_revision"`
-	ReceiptPath   string                  `json:"receipt_path,omitempty"`
+	Operation                 string                  `json:"operation"`
+	LineageID                 string                  `json:"lineage_id"`
+	State                     reviewtransaction.State `json:"state"`
+	Action                    string                  `json:"action"`
+	StoreRevision             string                  `json:"store_revision"`
+	ReceiptPath               string                  `json:"receipt_path,omitempty"`
+	BehavioralEvidenceWarning string                  `json:"behavioral_evidence_warning,omitempty"`
 }
 
 type ReviewInvalidateResult struct {
@@ -431,6 +432,7 @@ func RunReviewFacadeFinalize(args []string, stdout io.Writer) error {
 	validationPath := flags.String("validation", "", "targeted correction validation JSON file or - for stdin")
 	refuterPath := flags.String("refuter", "", "optional refuter outcomes JSON file or - for stdin")
 	evidencePath := flags.String("evidence", "", "final test or verification evidence file or - for stdin")
+	behavioralEvidencePath := flags.String("behavioral-evidence", "", "canonical behavioral evidence JSON file or - for stdin")
 	correctionLines := flags.Int("correction-lines", 0, "positive predicted correction changed lines before editing")
 	failed := flags.Bool("failed", false, "bind supplied final evidence as a failed verification")
 	tracePath := flags.String("trace", "", "optional diagnostic operation metadata trace path")
@@ -445,7 +447,7 @@ func RunReviewFacadeFinalize(args []string, stdout io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected review finalize argument %q", flags.Arg(0))
 	}
-	if countFacadeStdin(resultPaths, *validationPath, *refuterPath, *evidencePath) > 1 {
+	if countFacadeStdin(resultPaths, *validationPath, *refuterPath, *evidencePath, *behavioralEvidencePath) > 1 {
 		return errors.New("review finalize accepts stdin for only one input")
 	}
 	root, err := (reviewtransaction.SnapshotBuilder{Repo: *cwd}).ResolveRepositoryRoot(context.Background())
@@ -483,6 +485,23 @@ func RunReviewFacadeFinalize(args []string, stdout io.Writer) error {
 		evidence, err = readFacadeBytes(*evidencePath)
 		if err != nil {
 			return fmt.Errorf("read final review evidence: %w", err)
+		}
+	}
+	var behavioralEvidence *reviewtransaction.BehavioralEvidence
+	if strings.TrimSpace(*behavioralEvidencePath) != "" {
+		payload, err := readFacadeBytes(*behavioralEvidencePath)
+		if err != nil {
+			return fmt.Errorf("read behavioral evidence: %w", err)
+		}
+		parsed, err := reviewtransaction.ParseBehavioralEvidence(payload)
+		if err != nil {
+			return fmt.Errorf("read behavioral evidence: %w", err)
+		}
+		behavioralEvidence = &parsed
+	}
+	if state.State != reviewtransaction.StateCorrectionRequired {
+		if err := bindFacadeBehavioralEvidence(&state, behavioralEvidence); err != nil {
+			return err
 		}
 	}
 
@@ -533,8 +552,14 @@ func RunReviewFacadeFinalize(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if err := state.CompleteCorrection(fixSnapshot, actual, nativeValidation); err != nil {
-			return fmt.Errorf("complete compact correction: %w", err)
+		var completeErr error
+		if behavioralEvidence != nil {
+			completeErr = state.CompleteCorrectionWithBehavioralEvidence(fixSnapshot, actual, nativeValidation, *behavioralEvidence)
+		} else {
+			completeErr = state.CompleteCorrection(fixSnapshot, actual, nativeValidation)
+		}
+		if completeErr != nil {
+			return fmt.Errorf("complete compact correction: %w", completeErr)
 		}
 		revision, err := store.Replace(record.Revision, "review/complete-fix", state)
 		if err != nil {
@@ -622,7 +647,7 @@ func RunReviewFacadeValidate(args []string, stdout io.Writer) error {
 			input.PolicyArtifact = *policy
 		}
 		evaluation := reviewtransaction.EvaluateCompactGate(context.Background(), root, receipt, input)
-		return emitFacadeGateEvaluation(stdout, evaluation)
+		return emitFacadeGateEvaluation(stdout, evaluation, facadeBehavioralEvidenceWarning(compactRecord.State))
 	}
 
 	_, chain, artifacts, legacyErr := discoverFacadeReview(context.Background(), root, *lineage, true)
@@ -937,6 +962,7 @@ func facadeArtifactPaths(store reviewtransaction.Store) facadeArtifacts {
 func encodeCompactFacadeFinalize(stdout io.Writer, state reviewtransaction.CompactState, revision string, store reviewtransaction.CompactStore, action string) error {
 	result := ReviewFacadeFinalizeResult{
 		Operation: "review/finalize", LineageID: state.LineageID, State: state.State, Action: action, StoreRevision: revision,
+		BehavioralEvidenceWarning: facadeBehavioralEvidenceWarning(state),
 	}
 	if state.State == reviewtransaction.StateApproved || state.State == reviewtransaction.StateEscalated {
 		result.ReceiptPath = store.ReceiptPath()
@@ -944,10 +970,35 @@ func encodeCompactFacadeFinalize(stdout io.Writer, state reviewtransaction.Compa
 	return encodeReviewJSON(stdout, result)
 }
 
-func emitFacadeGateEvaluation(stdout io.Writer, evaluation reviewtransaction.NativeGateEvaluation) error {
+func bindFacadeBehavioralEvidence(state *reviewtransaction.CompactState, evidence *reviewtransaction.BehavioralEvidence) error {
+	if evidence == nil {
+		return nil
+	}
+	if state.BehavioralEvidence != nil {
+		return errors.New("behavioral evidence is already bound to the compact authority")
+	}
+	if evidence.CandidateTree != state.CurrentSnapshot.CandidateTree || evidence.PathsDigest != state.CurrentSnapshot.PathsDigest {
+		return errors.New("behavioral evidence is stale for the current compact candidate")
+	}
+	state.BehavioralEvidence = evidence
+	if err := state.Validate(); err != nil {
+		return fmt.Errorf("bind behavioral evidence: %w", err)
+	}
+	return nil
+}
+
+func facadeBehavioralEvidenceWarning(state reviewtransaction.CompactState) string {
+	if state.BehavioralEvidence == nil {
+		return "behavioral evidence was not supplied"
+	}
+	return ""
+}
+
+func emitFacadeGateEvaluation(stdout io.Writer, evaluation reviewtransaction.NativeGateEvaluation, behavioralEvidenceWarning string) error {
 	result := ReviewValidateResult{
 		Schema: ReviewValidateSchema, Result: evaluation.Result, Allowed: evaluation.Result == reviewtransaction.GateAllow,
 		Action: reviewGateAction(evaluation.Result), Reason: evaluation.Reason, Context: evaluation.Context,
+		BehavioralEvidenceWarning: behavioralEvidenceWarning,
 	}
 	if err := encodeReviewJSON(stdout, result); err != nil {
 		return err
