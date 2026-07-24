@@ -52,6 +52,13 @@ func TestExtractBoundedSingleJSONObject(t *testing.T) {
 	}
 }
 
+func TestValidateArtifactFindingIDsRejectsUnknownLens(t *testing.T) {
+	decision, diagnostic := ValidateArtifactFindingIDs(LensResult{Lens: "review-unknown"})
+	if decision != ArtifactAdmissionBindingMismatch || diagnostic != "reviewer finding ID is not bound to the selected lens" {
+		t.Fatalf("ValidateArtifactFindingIDs() = %q, %q; want binding mismatch with selected-lens diagnostic", decision, diagnostic)
+	}
+}
+
 func TestAdmitArtifactRequiresCompletedBoundInScopeInspection(t *testing.T) {
 	_, _, request := admittedArtifactFixture(t)
 	canonical, admission, err := AdmitArtifact(request)
@@ -100,6 +107,18 @@ func TestAdmitArtifactRequiresCompletedBoundInScopeInspection(t *testing.T) {
 		{name: "non ASCII finding id", mutate: func(r *ArtifactAdmissionRequest) {
 			r.Result.Findings[0].ID = "R3-é"
 		}, decision: ArtifactAdmissionBindingMismatch},
+		{name: "malformed finding id", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings[0].ID = "R3-"
+		}, decision: ArtifactAdmissionBindingMismatch},
+		{name: "cross-lens finding id", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings[0].ID = "R1-001"
+		}, decision: ArtifactAdmissionBindingMismatch},
+		{name: "duplicate finding id", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings = append(r.Result.Findings, r.Result.Findings[0])
+		}, decision: ArtifactAdmissionAmbiguous},
+		{name: "generated id collision", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings = append([]Finding{{Location: "internal/a.go:7", Severity: "WARNING", Claim: "generated", ProofRefs: []string{"diff: internal/a.go:7"}}}, r.Result.Findings...)
+		}, decision: ArtifactAdmissionAmbiguous},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

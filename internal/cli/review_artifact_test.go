@@ -124,6 +124,24 @@ func TestReviewCaptureResultRejectsSemanticAdmissionBeforePublication(t *testing
 				CausalDisposition: "introduced and behavior-activated",
 			}}
 		}},
+		{name: "malformed finding id", mutate: func(result *facadeReviewerResult) {
+			result.Findings = []facadeFinding{{ID: "R3-", Location: "tracked.txt:1", Severity: "WARNING", Claim: "malformed identity", ProofRefs: []string{"tracked.txt:1 observation"}}}
+		}},
+		{name: "cross-lens finding id", mutate: func(result *facadeReviewerResult) {
+			result.Findings = []facadeFinding{{ID: "R1-001", Location: "tracked.txt:1", Severity: "WARNING", Claim: "wrong lens identity", ProofRefs: []string{"tracked.txt:1 observation"}}}
+		}},
+		{name: "duplicate finding id", mutate: func(result *facadeReviewerResult) {
+			result.Findings = []facadeFinding{
+				{ID: "R3-001", Location: "tracked.txt:1", Severity: "WARNING", Claim: "first identity", ProofRefs: []string{"tracked.txt:1 observation"}},
+				{ID: "R3-001", Location: "tracked.txt:1", Severity: "SUGGESTION", Claim: "duplicate identity", ProofRefs: []string{"tracked.txt:1 observation"}},
+			}
+		}},
+		{name: "generated finding id collision", mutate: func(result *facadeReviewerResult) {
+			result.Findings = []facadeFinding{
+				{Location: "tracked.txt:1", Severity: "WARNING", Claim: "provider identity", ProofRefs: []string{"tracked.txt:1 observation"}},
+				{ID: "R3-001", Location: "tracked.txt:1", Severity: "SUGGESTION", Claim: "unstable explicit identity", ProofRefs: []string{"tracked.txt:1 observation"}},
+			}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,6 +161,10 @@ func TestReviewCaptureResultRejectsSemanticAdmissionBeforePublication(t *testing
 				t.Fatalf("semantic rejection consumed the immutable result slot: %v", statErr)
 			}
 			assertArtifactRevision(t, store, record.Revision)
+			after, loadErr := store.Load()
+			if loadErr != nil || !reflect.DeepEqual(after.State, record.State) {
+				t.Fatalf("semantic rejection mutated authority: load=%v before=%#v after=%#v", loadErr, record.State, after.State)
+			}
 		})
 	}
 }
@@ -162,7 +184,7 @@ func TestReviewCaptureResultFinalizePreservesCausalClassification(t *testing.T) 
 			repo, started, store, record := newArtifactReview(t, false)
 			result := admittedReviewerResultForTest(t, repo, record, record.State.SelectedLenses[0], 0)
 			result.Findings = []facadeFinding{{
-				ID: "R3-001", Location: "tracked.txt:1", Severity: "CRITICAL", Claim: "candidate failure",
+				Location: "tracked.txt:1", Severity: "CRITICAL", Claim: "candidate failure",
 				ProofRefs: []string{"tracked.txt:1 candidate-specific proof"}, EvidenceClass: tt.class, CausalDisposition: tt.causality,
 			}}
 			input := filepath.Join(t.TempDir(), "result.json")
@@ -199,6 +221,78 @@ func TestReviewCaptureResultFinalizePreservesCausalClassification(t *testing.T) 
 					finding, classification, finalized.State.State, finalized.State.Outcomes, finalized.State.FixFindingIDs)
 			}
 		})
+	}
+}
+
+func TestReviewCaptureResultCanonicalizesFindingIDsBeforeAdmissionAndReplay(t *testing.T) {
+	repo, started, _, record := newArtifactReview(t, false)
+	result := admittedReviewerResultForTest(t, repo, record, record.State.SelectedLenses[0], 0)
+	result.Findings = []facadeFinding{
+		{Location: "tracked.txt:1", Severity: "CRITICAL", Claim: "candidate failure", ProofRefs: []string{"tracked.txt:1 changed hunk"}, EvidenceClass: reviewtransaction.EvidenceDeterministic, CausalDisposition: reviewtransaction.CausalIntroduced},
+		{Location: "tracked.txt:1", Severity: "WARNING", Claim: "causality unknown", ProofRefs: []string{"tracked.txt:1 observation"}, EvidenceClass: reviewtransaction.EvidenceInsufficient, CausalDisposition: reviewtransaction.CausalUnknown},
+		{ID: "R3-CUSTOM", Location: "tracked.txt:1", Severity: "SUGGESTION", Claim: "explicit identity", ProofRefs: []string{"tracked.txt:1 observation"}},
+	}
+	input := filepath.Join(t.TempDir(), "result.json")
+	writeReviewCLIJSON(t, input, result)
+	raw, _ := os.ReadFile(input)
+	args := []string{"--cwd", repo, "--lineage", started.LineageID, "--target", record.State.InitialSnapshot.Identity, "--lens", record.State.SelectedLenses[0], "--order", "0", "--input", input}
+	var first, replay bytes.Buffer
+	if err := RunReviewCaptureResult(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunReviewCaptureResult(args, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunReviewCaptureResult(args, &replay); err != nil || first.String() != replay.String() {
+		t.Fatalf("canonical replay changed: %v", err)
+	}
+	if after, err := os.ReadFile(input); err != nil || !bytes.Equal(after, raw) {
+		t.Fatalf("capture rewrote preserved reviewer output: read=%v", err)
+	}
+	var artifact reviewResultArtifact
+	decodeStrictReviewJSON(t, first.Bytes(), &artifact)
+	payload, err := os.ReadFile(artifact.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope admittedReviewerResult
+	decodeStrictReviewJSON(t, payload, &envelope)
+	if got := []string{envelope.Result.Findings[0].ID, envelope.Result.Findings[1].ID, envelope.Result.Findings[2].ID}; !reflect.DeepEqual(got, []string{"R3-001", "R3-002", "R3-CUSTOM"}) {
+		t.Fatalf("canonical finding IDs = %v", got)
+	}
+	canonical, _ := json.Marshal(envelope.Result)
+	canonical = append(canonical, '\n')
+	if envelope.Admission.CanonicalSHA256 != facadePayloadHash(canonical) || artifact.SHA256 != facadePayloadHash(payload) {
+		t.Fatalf("canonical payload identity diverged: artifact=%#v admission=%#v", artifact, envelope.Admission)
+	}
+	if !reflect.DeepEqual(envelope.Admission.CandidateCausalFindingIDs, []string{"R3-001"}) {
+		t.Fatalf("candidate-causal IDs = %v", envelope.Admission.CandidateCausalFindingIDs)
+	}
+}
+
+func TestReviewCaptureResultCanonicalizesPreservedRiskFindingWithoutID(t *testing.T) {
+	repo, started, _, record := newArtifactReview(t, true)
+	if record.State.SelectedLenses[0] != reviewtransaction.LensRisk {
+		t.Fatalf("high-risk fixture first lens = %q", record.State.SelectedLenses[0])
+	}
+	result := admittedReviewerResultForTest(t, repo, record, reviewtransaction.LensRisk, 0)
+	result.Findings = []facadeFinding{{
+		Location: "service-token.ts:1", Severity: "CRITICAL", Claim: "preserved severe review-risk finding",
+		ProofRefs: []string{"service-token.ts:1 observation"}, EvidenceClass: reviewtransaction.EvidenceInsufficient, CausalDisposition: reviewtransaction.CausalUnknown,
+	}}
+	input := filepath.Join(t.TempDir(), "preserved-review-risk.json")
+	writeReviewCLIJSON(t, input, result)
+	var output bytes.Buffer
+	if err := RunReviewCaptureResult([]string{"--cwd", repo, "--lineage", started.LineageID, "--target", record.State.InitialSnapshot.Identity, "--lens", reviewtransaction.LensRisk, "--order", "0", "--input", input}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var artifact reviewResultArtifact
+	decodeStrictReviewJSON(t, output.Bytes(), &artifact)
+	payload, _ := os.ReadFile(artifact.Path)
+	var envelope admittedReviewerResult
+	decodeStrictReviewJSON(t, payload, &envelope)
+	if got := envelope.Result.Findings[0].ID; got != "R1-001" {
+		t.Fatalf("preserved review-risk finding ID = %q", got)
 	}
 }
 
@@ -537,23 +631,45 @@ func TestReviewArtifactSubstitutionFailsBeforeMutation(t *testing.T) {
 func TestReviewCaptureResultConcurrentSelectedLenses(t *testing.T) {
 	repo, started, store, record := newArtifactReview(t, true)
 	manifests := make([]string, len(record.State.SelectedLenses))
+	inputs := make([]string, len(record.State.SelectedLenses))
+	for order := range inputs {
+		inputs[order] = filepath.Join(t.TempDir(), fmt.Sprintf("%d.json", order))
+	}
+	errs := make(chan error, len(record.State.SelectedLenses))
 	var wg sync.WaitGroup
 	for order, lens := range record.State.SelectedLenses {
 		wg.Add(1)
-		go func() {
+		go func(order int, lens, input string) {
 			defer wg.Done()
-			input := filepath.Join(t.TempDir(), fmt.Sprintf("%d.json", order))
-			_ = os.WriteFile(input, admittedReviewerPayloadForTest(t, repo, record, lens, order), 0o600)
-			var output bytes.Buffer
-			err := RunReviewCaptureResult([]string{"--cwd", repo, "--lineage", started.LineageID, "--target", record.State.InitialSnapshot.Identity, "--lens", lens, "--order", fmt.Sprint(order), "--input", input}, &output)
+			result, err := admittedReviewerResultForTestErr(repo, record, lens, order)
 			if err != nil {
-				t.Errorf("capture %s: %v", lens, err)
+				errs <- err
+				return
+			}
+			result.Findings = []facadeFinding{{Location: "service-token.ts:1", Severity: "WARNING", Claim: "concurrent finding", ProofRefs: []string{"service-token.ts:1 observation"}}}
+			payload, err := json.Marshal(result)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if err := os.WriteFile(input, payload, 0o600); err != nil {
+				errs <- err
+				return
+			}
+			var output bytes.Buffer
+			err = RunReviewCaptureResult([]string{"--cwd", repo, "--lineage", started.LineageID, "--target", record.State.InitialSnapshot.Identity, "--lens", lens, "--order", fmt.Sprint(order), "--input", input}, &output)
+			if err != nil {
+				errs <- fmt.Errorf("capture %s: %w", lens, err)
 				return
 			}
 			manifests[order] = strings.TrimSpace(output.String())
-		}()
+		}(order, lens, inputs[order])
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 	if _, err := readFacadeReviewerArtifacts(context.Background(), repo, manifests, store.Dir, record.State, record.Revision); err != nil {
 		t.Fatal(err)
 	}
@@ -628,13 +744,21 @@ func admittedReviewerPayloadForTest(t *testing.T, repo string, record reviewtran
 
 func admittedReviewerResultForTest(t *testing.T, repo string, record reviewtransaction.CompactRecord, lens string, order int) facadeReviewerResult {
 	t.Helper()
-	frozen, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).FrozenCandidateContext(context.Background(), record.State.InitialSnapshot)
+	result, err := admittedReviewerResultForTestErr(repo, record, lens, order)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return result
+}
+
+func admittedReviewerResultForTestErr(repo string, record reviewtransaction.CompactRecord, lens string, order int) (facadeReviewerResult, error) {
+	frozen, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).FrozenCandidateContext(context.Background(), record.State.InitialSnapshot)
+	if err != nil {
+		return facadeReviewerResult{}, err
+	}
 	subject, err := reviewtransaction.NewArtifactSubject(record.State, record.Revision, frozen, lens, order, "")
 	if err != nil {
-		t.Fatal(err)
+		return facadeReviewerResult{}, err
 	}
 	paths := make([]string, len(frozen.ChangedPathManifest))
 	for index, entry := range frozen.ChangedPathManifest {
@@ -644,7 +768,7 @@ func admittedReviewerResultForTest(t *testing.T, repo string, record reviewtrans
 		SubjectHash: subject.SubjectHash,
 		Inspection:  reviewtransaction.ArtifactInspection{Status: reviewtransaction.ArtifactInspectionCompleted, Paths: paths},
 		Findings:    []facadeFinding{}, Evidence: []string{"inspection: reviewed every frozen candidate path"},
-	}
+	}, nil
 }
 
 func capturedArtifact(t *testing.T) (string, ReviewFacadeStartResult, reviewtransaction.CompactStore, reviewtransaction.CompactRecord, reviewResultArtifact) {
