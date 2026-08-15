@@ -120,9 +120,10 @@ func resolveGoverningAuthority(ctx context.Context, root, lineage string, gateIn
 			// `review finalize` for THIS case named a continuation that would
 			// itself refuse -- the honest continuation is a fresh lineage.
 			receiptAbsent := receiptErr != nil && os.IsNotExist(receiptErr)
-			receiptInvalid := receiptErr == nil && (receipt.LineageID != record.Authority.LineageID ||
-				receipt.AuthorityRevision != record.Revision || receipt.TerminalState != record.Authority.State ||
-				receipt.CandidateIdentity != record.Authority.CandidateIdentity)
+			if receiptErr == nil {
+				receiptErr = reviewtransaction.ValidateNewLineageReceiptAgainstAuthority(record, receipt)
+			}
+			receiptInvalid := receiptErr != nil && !receiptAbsent
 			receiptUnreadable := receiptErr != nil && !receiptAbsent
 			if receiptAbsent || receiptInvalid || receiptUnreadable {
 				reason := reviewFacadeReceiptNotAvailableReason(record.Authority.LineageID)
@@ -151,6 +152,17 @@ func resolveGoverningAuthority(ctx context.Context, root, lineage string, gateIn
 				BaseTree: record.Authority.CandidateIdentity.BaseTree, CandidateTree: record.Authority.CandidateIdentity.CandidateTree,
 				PolicyHash: record.Authority.CandidateIdentity.PolicyHash,
 				Denial:     &reviewtransaction.GateDenial{Stage: "new-lineage-validate", Code: string(reviewtransaction.NewLineageStateEscalated)},
+			}
+			authorityStore, storeErr := reviewtransaction.NewLineageAuthorityStore(ctx, root, lineage)
+			if storeErr != nil {
+				return true, false, reviewtransaction.NativeGateEvaluation{Result: reviewtransaction.GateInvalidated, Reason: "new-lineage receipt authority cannot be opened: " + storeErr.Error(), Context: context, Cause: storeErr}, nil
+			}
+			receipt, receiptErr := authorityStore.LoadReceipt()
+			if receiptErr == nil {
+				receiptErr = reviewtransaction.ValidateNewLineageReceiptAgainstAuthority(record, receipt)
+			}
+			if receiptErr != nil {
+				return true, false, reviewtransaction.NativeGateEvaluation{Result: reviewtransaction.GateInvalidated, Reason: "new-lineage receipt aggregate binding is not valid: " + receiptErr.Error(), Context: context, Cause: receiptErr}, nil
 			}
 			return true, false, reviewtransaction.NativeGateEvaluation{Result: reviewtransaction.GateEscalated, Reason: "authority already escalated: escalated is a terminal non-approval", Context: context}, nil
 		default: // reviewing, correcting, validating — and any future non-approved value

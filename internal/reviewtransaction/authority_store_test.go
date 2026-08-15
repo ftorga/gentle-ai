@@ -92,6 +92,59 @@ func TestAuthorityStoreNewLineageWritesExactlyTwoArtifacts(t *testing.T) {
 	}
 }
 
+func TestAuthorityStoreLoadReceiptAcceptsOnlyAbsentDigestAsLegacy(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	store, err := NewLineageAuthorityStore(context.Background(), repo, "legacy-receipt-shape")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := fixtureNewLineageAuthority("legacy-receipt-shape", NewLineageStateApproved)
+	authority.SelectedLenses = []string{"review-risk"}
+	authority.CapturedResults = []NewLineageCapturedResult{{Lens: "review-risk", Order: 0, SubjectHash: NewLineageArtifactSubjectHash(authority, "review-risk", 0)}}
+	revision, err := store.Mutate(context.Background(), "", func(next *NewLineageAuthority) error {
+		*next = authority
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := NewLineageReceipt{
+		Schema: NewLineageReceiptSchema, LineageID: authority.LineageID,
+		TerminalState: authority.State, AuthorityRevision: revision,
+		CandidateIdentity: authority.CandidateIdentity,
+	}
+	payload := mustJSON(t, receipt)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "provider_causal_aggregate_digest")
+	payload = mustJSON(t, fields)
+	if err := os.WriteFile(store.ReceiptPath(), append(payload, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadReceipt()
+	if err != nil {
+		t.Fatalf("LoadReceipt rejected a valid pre-digest receipt: %v", err)
+	}
+	if !loaded.legacyProviderCausalAggregateDigest {
+		t.Fatal("LoadReceipt did not retain the proven legacy receipt shape")
+	}
+
+	for name, value := range map[string]any{"empty": "", "null": nil} {
+		t.Run(name, func(t *testing.T) {
+			fields["provider_causal_aggregate_digest"] = mustJSON(t, value)
+			payload := mustJSON(t, fields)
+			if err := os.WriteFile(store.ReceiptPath(), append(payload, '\n'), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.LoadReceipt(); err == nil {
+				t.Fatal("LoadReceipt accepted a declared empty provider aggregate digest")
+			}
+		})
+	}
+}
+
 // TestAuthorityStoreMutateRefusesStaleExpectedRevision is task 3.2's first
 // RED assertion (spec rdd-authority-store, "Stale revision refuses the
 // write"): a CAS mismatch refuses and leaves the artifact unchanged.
@@ -202,9 +255,18 @@ func TestAuthorityStoreResolveReplayReturnsStoredTransitionWithoutMutation(t *te
 	}
 	mutated := record
 	mutated.Authority.CapturedResults = append([]NewLineageCapturedResult(nil), record.Authority.CapturedResults...)
-	mutated.Authority.CapturedResults[0].Provider.AggregateDigest = "sha256:" + strings.Repeat("0", 64)
+	mutated.Authority.CapturedResults[0].Provider.Findings[0].Location = " changed.go:3"
+	mutated.Authority.CapturedResults[0].Provider.Findings[0].EvidenceDigest = providerFindingDigest(mutated.Authority.CapturedResults[0].Provider.Findings[0])
+	mutated.Authority.CapturedResults[0].Provider.AggregateDigest = providerAggregateDigest(mutated.Authority.CapturedResults[0].Provider)
 	if _, _, err := mutated.ResolveReplay("request-digest-1"); err == nil {
-		t.Fatal("accepted replay after provider aggregate changed")
+		t.Fatal("accepted replay after noncanonical provider location")
+	}
+	mutated = record
+	mutated.Authority.CapturedResults = append([]NewLineageCapturedResult(nil), record.Authority.CapturedResults...)
+	mutated.Authority.CapturedResults[0].Provider.ArtifactBinding.Subject.SubjectHash = "sha256:" + strings.Repeat("0", 64)
+	mutated.Authority.CapturedResults[0].Provider.AggregateDigest = providerAggregateDigest(mutated.Authority.CapturedResults[0].Provider)
+	if _, _, err := mutated.ResolveReplay("request-digest-1"); err == nil {
+		t.Fatal("accepted replay after provider artifact binding mismatch")
 	}
 
 	// A genuinely different request while NOT correcting is not a replay,

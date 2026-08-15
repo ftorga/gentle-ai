@@ -3,6 +3,7 @@ package reviewtransaction
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,9 @@ func (c ProviderCausalCarrier) Validate() error {
 		if f.FindingID == "" || (i > 0 && f.FindingID <= c.Findings[i-1].FindingID) {
 			return errors.New("provider causal carrier findings must be unique and canonical") // refusal:by-design world-action: immutable carrier findings cannot be canonicalized safely by an operator command
 		}
+		if f.Location != strings.TrimSpace(f.Location) {
+			return errors.New("provider causal carrier finding location must be canonical") // refusal:by-design world-action: immutable carrier locations cannot be canonicalized safely by an operator command
+		}
 		if f.Classification != ProviderCandidateCausal && f.Classification != ProviderProvenNonCandidate && f.Classification != ProviderUnknown {
 			return errors.New("provider causal carrier classification is unsupported") // refusal:by-design world-action: an unsupported provider classification requires corrected source evidence, not an operator command
 		}
@@ -77,6 +81,9 @@ func (c ProviderCausalCarrier) Validate() error {
 	}
 	if c.AggregateDigest != providerAggregateDigest(c) {
 		return errors.New("provider causal carrier aggregate digest does not match its findings") // refusal:by-design world-action: an immutable aggregate mismatch cannot be repaired safely by an operator command
+	}
+	if c.ArtifactBinding.Subject.SubjectHash != "" && c.ArtifactBinding.Subject.SubjectHash != c.SubjectHash {
+		return errors.New("provider causal carrier artifact binding subject hash does not match carrier") // refusal:by-design world-action: an immutable binding mismatch requires fresh capture
 	}
 	return nil
 }
@@ -92,6 +99,44 @@ func canonicalProviderProofRefs(refs []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (authority NewLineageAuthority) ProviderCausalCarrierDigest() (string, error) {
+	type entry struct{ Lens, SubjectHash, AggregateDigest string }
+	entries := make([]entry, 0, len(authority.CapturedResults))
+	for _, captured := range authority.CapturedResults {
+		if captured.Provider.SubjectHash == "" {
+			continue
+		}
+		if err := captured.Provider.Validate(); err != nil {
+			return "", err
+		}
+		if captured.Provider.SubjectHash != captured.SubjectHash || captured.Provider.CandidateIdentity != authority.CandidateIdentity {
+			// refusal:by-design world-action: mismatched or corrupt persisted authority must be restored and re-reviewed; no caller command can reinterpret it
+			return "", errors.New("provider causal authority aggregate has an invalid carrier binding")
+		}
+		entries = append(entries, entry{captured.Lens, captured.SubjectHash, captured.Provider.AggregateDigest})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Lens < entries[j].Lens })
+	payload, _ := json.Marshal(struct {
+		Candidate CandidateIdentity `json:"candidate_identity"`
+		Carriers  []entry           `json:"carriers"`
+	}{authority.CandidateIdentity, entries})
+	sum := sha256.Sum256(append([]byte("gentle-ai.provider-causal-authority/v1\x00"), payload...))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+func (authority NewLineageAuthority) ProviderCausalReceiptDigest(revision string) (string, error) {
+	if !validSHA256(revision) {
+		// refusal:by-design world-action: an invalid authority revision must be restored and re-reviewed; no caller command can reinterpret it
+		return "", errors.New("provider causal aggregate requires a valid authority revision")
+	}
+	carrier, err := authority.ProviderCausalCarrierDigest()
+	if err != nil {
+		return "", err
+	}
+	payload, _ := json.Marshal(struct{ AuthorityRevision, CarrierDigest string }{revision, carrier})
+	sum := sha256.Sum256(append([]byte("gentle-ai.provider-causal-aggregate/v1\x00"), payload...))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 func canonicalProviderClaims(in []ProviderCausalEvidence) ([]ProviderCausalEvidence, error) {
 	out := append([]ProviderCausalEvidence(nil), in...)

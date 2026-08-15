@@ -11,6 +11,7 @@ package reviewtransaction
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,91 @@ func newLineageGateFixtureRecord(baseTree, candidateTree string) NewLineageRecor
 			LineageID: "new-lineage-gate-fixture", State: NewLineageStateApproved,
 			CandidateIdentity: CandidateIdentity{BaseTree: baseTree, CandidateTree: candidateTree, PolicyHash: "sha256:" + hash("policy")},
 		},
+	}
+}
+
+func escalatedNewLineageGateFixture(t *testing.T) (string, AuthorityStore, NewLineageRecord, NewLineageReceipt) {
+	t.Helper()
+	repo := initSnapshotRepo(t)
+	const lineage = "escalated-new-lineage-gate"
+	store, err := NewLineageAuthorityStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := fixtureNewLineageAuthority(lineage, NewLineageStateEscalated)
+	if _, err := store.Mutate(context.Background(), "", func(next *NewLineageAuthority) error {
+		*next = authority
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := record.Authority.ProviderCausalReceiptDigest(record.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := NewLineageReceipt{
+		Schema: NewLineageReceiptSchema, LineageID: lineage,
+		TerminalState: NewLineageStateEscalated, AuthorityRevision: record.Revision,
+		CandidateIdentity: record.Authority.CandidateIdentity, ProviderCausalAggregateDigest: digest,
+	}
+	if err := store.WriteReceipt(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	return repo, store, record, receipt
+}
+
+func TestEvaluateNewLineageGateAcceptsValidLegacyReceipt(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	const lineage = "legacy-new-lineage-gate"
+	store, err := NewLineageAuthorityStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := fixtureNewLineageAuthority(lineage, NewLineageStateApproved)
+	if _, err := store.Mutate(context.Background(), "", func(next *NewLineageAuthority) error {
+		*next = authority
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := NewLineageReceipt{
+		Schema: NewLineageReceiptSchema, LineageID: lineage,
+		TerminalState: NewLineageStateApproved, AuthorityRevision: record.Revision,
+		CandidateIdentity: record.Authority.CandidateIdentity,
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "provider_causal_aggregate_digest")
+	payload, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.ReceiptPath(), append(payload, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, gate := range []GateKind{GatePostApply, GatePreCommit, GatePrePush} {
+		t.Run(string(gate), func(t *testing.T) {
+			evaluation := EvaluateNewLineageGate(context.Background(), repo, record, CoreTransition{
+				Kind: CoreTransitionContinue, ReasonCode: string(ShadowRelationExact),
+			}, record.Authority.CandidateIdentity, NativeGateRequestInput{Gate: gate})
+			if evaluation.Result != GateAllow {
+				t.Fatalf("valid legacy receipt gate = %#v, want allow", evaluation)
+			}
+		})
 	}
 }
 
@@ -40,16 +126,10 @@ func TestEvaluateNewLineageGate_ContinueConsultsGateVerdictPreconditions(t *test
 	// a real repository.
 	live := CandidateIdentity{BaseTree: "a-different-base-tree", CandidateTree: "candidate-tree"}
 
-	for _, gate := range []GateKind{GatePostApply, GatePreCommit, GatePrePush} {
-		evaluation := EvaluateNewLineageGate(context.Background(), "", record, transition, live, NativeGateRequestInput{Gate: gate})
-		if evaluation.Result != GateAllow {
-			t.Fatalf("gate %q with a diverged base must still allow (precondition is pre-pr/release only): %#v", gate, evaluation)
-		}
-	}
-	for _, gate := range []GateKind{GatePrePR, GateRelease} {
+	for _, gate := range []GateKind{GatePostApply, GatePreCommit, GatePrePush, GatePrePR, GateRelease} {
 		evaluation := EvaluateNewLineageGate(context.Background(), "", record, transition, live, NativeGateRequestInput{Gate: gate})
 		if evaluation.Result == GateAllow {
-			t.Fatalf("gate %q allowed an approved v3 receipt with a diverged base and no release evidence; want deny (CRITICAL-C, absorbed N2 must actually be enforced)", gate)
+			t.Fatalf("gate %q allowed without a persisted receipt aggregate: %#v", gate, evaluation)
 		}
 	}
 }
@@ -86,8 +166,8 @@ func TestEvaluateNewLineageGate_ReleaseRequiresDerivedEvidence(t *testing.T) {
 		ReleaseEvidenceFreshness:   artifact("evidence-freshness.txt", "evidence freshness\n"),
 	}
 	withRelease := EvaluateNewLineageGate(context.Background(), repo, record, transition, live, gateInput)
-	if withRelease.Result != GateAllow {
-		t.Fatalf("release denied with real release evidence supplied and a matching base: %#v", withRelease)
+	if withRelease.Result == GateAllow {
+		t.Fatalf("release allowed with release evidence but without a persisted receipt: %#v", withRelease)
 	}
 }
 
@@ -105,8 +185,8 @@ func TestEvaluateNewLineageGate_NonContinueTransitionsUnaffected(t *testing.T) {
 		t.Fatalf("collect transition = %#v, want scope-changed regardless of release evidence", collect)
 	}
 	escalate := EvaluateNewLineageGate(context.Background(), "", record, CoreTransition{Kind: CoreTransitionEscalate, ReasonCode: string(ShadowRelationAmbiguous)}, live, NativeGateRequestInput{Gate: GateRelease})
-	if escalate.Result != GateEscalated {
-		t.Fatalf("escalate transition = %#v, want escalated regardless of release evidence", escalate)
+	if escalate.Result != GateInvalidated {
+		t.Fatalf("escalate transition without receipt = %#v, want invalidated", escalate)
 	}
 	for _, kind := range []CoreTransitionKind{CoreTransitionApprove, CoreTransitionRepair, CoreTransitionStop} {
 		evaluation := EvaluateNewLineageGate(context.Background(), "", record, CoreTransition{Kind: kind}, live, NativeGateRequestInput{Gate: GatePreCommit})

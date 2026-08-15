@@ -270,6 +270,9 @@ func (authority NewLineageAuthority) Validate() error {
 			}
 		}
 	}
+	if authority.ProviderCausalAggregateDigest != "" && authority.ProviderCausalAggregateDigest != ProviderCausalAggregateDigest(authority) {
+		return errors.New("new-lineage authority provider causal aggregate digest does not match captured carriers") // refusal:by-design operator-knowledge: persisted provider authority is contradictory and requires a fresh provider capture
+	}
 	if authority.ReplayIdentity != "" && !validSHA256(authority.ReplayIdentity) {
 		return errors.New("new-lineage authority replay identity must be a canonical digest") // refusal:by-design world-action: the replay identity is only ever set by RecordTransition's own digest computation; a malformed value means in-process corruption, not something an operator command repairs
 	}
@@ -633,6 +636,9 @@ type NewLineageReceipt struct {
 	AuthorityRevision string            `json:"authority_revision"`
 	CandidateIdentity CandidateIdentity `json:"candidate_identity"`
 	IssuedTransition  json.RawMessage   `json:"issued_transition,omitempty"`
+
+	ProviderCausalAggregateDigest       string `json:"provider_causal_aggregate_digest"`
+	legacyProviderCausalAggregateDigest bool
 }
 
 // Validate enforces the structural half of receipt issuance; ReviewCore
@@ -652,6 +658,9 @@ func (receipt NewLineageReceipt) Validate() error {
 	}
 	if receipt.CandidateIdentity == (CandidateIdentity{}) {
 		return errors.New("new-lineage receipt requires the frozen candidate identity") // refusal:by-design world-action: a zero CandidateIdentity on a receipt means the caller never copied the frozen one from the authority record; the fix is that code, not an operator command
+	}
+	if receipt.ProviderCausalAggregateDigest != "" && !validSHA256(receipt.ProviderCausalAggregateDigest) {
+		return errors.New("new-lineage receipt provider causal aggregate digest must be a canonical digest") // refusal:by-design operator-knowledge: a declared malformed digest is immutable receipt corruption and cannot be repaired at a gate
 	}
 	if len(receipt.IssuedTransition) > 0 && !json.Valid(receipt.IssuedTransition) {
 		return errors.New("new-lineage receipt issued transition must be valid JSON") // refusal:by-design world-action: the issued-transition payload is the caller's own copy of an already-validated transition; malformed JSON here is a caller bug, not an operator-fixable state
@@ -693,8 +702,21 @@ func (store AuthorityStore) WriteReceipt(ctx context.Context, receipt NewLineage
 	if record.Authority.State != receipt.TerminalState {
 		return errors.New("new-lineage receipt terminal state does not match authority state") // refusal:by-design world-action: the terminal receipt must reflect the exact state Mutate already committed; a mismatch is a caller ordering bug (WriteReceipt called before or after the matching Mutate), not an operator-fixable state
 	}
+	wantDigest, err := record.Authority.ProviderCausalReceiptDigest(receipt.AuthorityRevision)
+	if err != nil {
+		return err
+	}
+	if receipt.ProviderCausalAggregateDigest == "" || receipt.ProviderCausalAggregateDigest == ProviderCausalAggregateDigest(record.Authority) {
+		receipt.ProviderCausalAggregateDigest = wantDigest
+	}
+	if err := receipt.Validate(); err != nil {
+		return err
+	}
 	if record.Authority.CandidateIdentity != receipt.CandidateIdentity {
 		return errors.New("new-lineage receipt candidate identity does not match authority") // refusal:by-design world-action: the receipt must carry the exact frozen identity the authority already recorded; a mismatch is a caller construction bug, not an operator-fixable state
+	}
+	if receipt.ProviderCausalAggregateDigest != wantDigest {
+		return errors.New("new-lineage receipt provider causal aggregate digest does not match authority") // refusal:by-design world-action: a tampered receipt requires a fresh terminal receipt and cannot be trusted at gates
 	}
 	receiptPayload, err := json.MarshalIndent(receipt, "", "  ")
 	if err != nil {
@@ -720,8 +742,34 @@ func (store AuthorityStore) LoadReceipt() (NewLineageReceipt, error) {
 	if err := json.Unmarshal(payload, &receipt); err != nil {
 		return NewLineageReceipt{}, err
 	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(payload, &fields)
+	_, digestDeclared := fields["provider_causal_aggregate_digest"]
+	if digestDeclared && receipt.ProviderCausalAggregateDigest == "" {
+		return NewLineageReceipt{}, errors.New("new-lineage receipt provider causal aggregate digest must be declared and non-empty") // refusal:by-design operator-knowledge: an explicitly empty digest is not the pre-digest receipt shape and cannot authorize a gate
+	}
 	if err := receipt.Validate(); err != nil {
 		return NewLineageReceipt{}, err
+	}
+	receipt.legacyProviderCausalAggregateDigest = !digestDeclared
+	payload, err = os.ReadFile(store.StatePath())
+	if err != nil {
+		return NewLineageReceipt{}, err
+	}
+	record, err := parseNewLineageRecord(payload, store.lineageID)
+	if err != nil {
+		return NewLineageReceipt{}, err
+	}
+	if record.Authority.LineageID != receipt.LineageID || record.Revision != receipt.AuthorityRevision || record.Authority.State != receipt.TerminalState || record.Authority.CandidateIdentity != receipt.CandidateIdentity {
+		// refusal:by-design world-action: mismatched or corrupt persisted authority must be restored and re-reviewed; no caller command can reinterpret it
+		return NewLineageReceipt{}, errors.New("new-lineage receipt does not match authority")
+	}
+	wantDigest, err := record.Authority.ProviderCausalReceiptDigest(receipt.AuthorityRevision)
+	if err != nil {
+		return NewLineageReceipt{}, err
+	}
+	if !receipt.legacyProviderCausalAggregateDigest && receipt.ProviderCausalAggregateDigest != wantDigest {
+		return NewLineageReceipt{}, errors.New("new-lineage receipt provider causal aggregate digest does not match authority") // refusal:by-design world-action: a tampered receipt requires a fresh terminal receipt and cannot be trusted at gates
 	}
 	return receipt, nil
 }

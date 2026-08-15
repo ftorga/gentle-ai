@@ -21,7 +21,28 @@ package reviewtransaction
 // -- deriving release evidence for those paths would be unnecessary work for
 // an outcome gateVerdict cannot change.
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
+
+func ValidateNewLineageReceiptAgainstAuthority(record NewLineageRecord, receipt NewLineageReceipt) error {
+	authority := record.Authority
+	if receipt.LineageID != authority.LineageID || receipt.AuthorityRevision != record.Revision || receipt.TerminalState != authority.State || receipt.CandidateIdentity != authority.CandidateIdentity {
+		return fmt.Errorf("new-lineage receipt does not match the governing authority") // refusal:by-design world-action: a mismatched immutable receipt has no operator repair path; the v3 candidate must be re-reviewed
+	}
+	if receipt.legacyProviderCausalAggregateDigest {
+		return nil
+	}
+	expectedDigest, err := authority.ProviderCausalReceiptDigest(record.Revision)
+	if err != nil {
+		return fmt.Errorf("new-lineage receipt provider causal aggregate cannot be recomputed: %w", err)
+	}
+	if receipt.ProviderCausalAggregateDigest == "" || receipt.ProviderCausalAggregateDigest != expectedDigest {
+		return fmt.Errorf("new-lineage receipt provider causal aggregate does not match the governing authority") // refusal:by-design world-action: a mismatched immutable receipt has no operator repair path; the v3 candidate must be re-reviewed
+	}
+	return nil
+}
 
 // EvaluateNewLineageGate translates a ReviewCore validate CoreTransition into
 // gate JSON. live is the caller's already-resolved live CandidateIdentity
@@ -35,6 +56,19 @@ func EvaluateNewLineageGate(ctx context.Context, root string, record NewLineageR
 		Gate: gate, LineageID: record.Authority.LineageID, StoreRevision: record.Revision,
 		BaseTree: record.Authority.CandidateIdentity.BaseTree, CandidateTree: record.Authority.CandidateIdentity.CandidateTree,
 		PolicyHash: record.Authority.CandidateIdentity.PolicyHash,
+	}
+	if transition.Kind == CoreTransitionContinue || transition.Kind == CoreTransitionEscalate {
+		store, storeErr := NewLineageAuthorityStore(ctx, root, record.Authority.LineageID)
+		if storeErr != nil {
+			return NativeGateEvaluation{Result: GateInvalidated, Reason: "new-lineage receipt authority cannot be opened: " + storeErr.Error(), Context: context, Cause: storeErr}
+		}
+		receipt, receiptErr := store.LoadReceipt()
+		if receiptErr == nil {
+			receiptErr = ValidateNewLineageReceiptAgainstAuthority(record, receipt)
+		}
+		if receiptErr != nil {
+			return NativeGateEvaluation{Result: GateInvalidated, Reason: "new-lineage receipt aggregate binding is not valid: " + receiptErr.Error(), Context: context, Cause: receiptErr}
+		}
 	}
 	switch transition.Kind {
 	case CoreTransitionContinue:

@@ -61,6 +61,9 @@ func TestCaptureLensResultWithoutProviderEvidenceOmitsProviderCausalJSON(t *test
 	if payload, err := json.Marshal(updated.Authority.CapturedResults[0]); err != nil || strings.Contains(string(payload), `"provider_causal"`) {
 		t.Fatalf("captured result JSON = %s, %v", payload, err)
 	}
+	if _, err := updated.Authority.ProviderCausalReceiptDigest(updated.Revision); err != nil {
+		t.Fatalf("ProviderCausalReceiptDigest rejected a captured result without provider evidence: %v", err)
+	}
 	if !hasCapturedAllSelectedLenses(updated.Authority.SelectedLenses, updated.Authority.CapturedLensNames()) {
 		t.Fatalf("hasCapturedAllSelectedLenses = false after capturing every selected lens: captured=%v selected=%v",
 			updated.Authority.CapturedLensNames(), updated.Authority.SelectedLenses)

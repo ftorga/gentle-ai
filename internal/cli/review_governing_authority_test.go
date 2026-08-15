@@ -13,6 +13,19 @@ import (
 	"github.com/gentleman-programming/gentle-ai/v2/internal/reviewtransaction"
 )
 
+func providerDigestForStore(t *testing.T, store reviewtransaction.AuthorityStore) string {
+	t.Helper()
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := record.Authority.ProviderCausalReceiptDigest(record.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
 // TestResolveGoverningAuthorityAbsentWithoutMarkerCostsNoGitCall proves the
 // cheap common case at the CLI wiring layer: with no explicit --lineage
 // marker, resolveGoverningAuthority returns "legacy governs unchanged"
@@ -214,10 +227,11 @@ func TestResolveGoverningAuthorityApprovedWithValidReceiptAllowsExactCandidate(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := providerDigestForStore(t, store)
 	if err := store.WriteReceipt(context.Background(), reviewtransaction.NewLineageReceipt{
 		Schema: reviewtransaction.NewLineageReceiptSchema, LineageID: lineage,
 		TerminalState: reviewtransaction.NewLineageStateApproved, AuthorityRevision: revision,
-		CandidateIdentity: live,
+		CandidateIdentity: live, ProviderCausalAggregateDigest: digest,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -226,19 +240,36 @@ func TestResolveGoverningAuthorityApprovedWithValidReceiptAllowsExactCandidate(t
 	if !governs || discoveryErr != nil || evaluation.Result != reviewtransaction.GateAllow {
 		t.Fatalf("approved authority with a valid receipt and exact live candidate must allow, got governs=%v evaluation=%#v discoveryErr=%v", governs, evaluation, discoveryErr)
 	}
+
+	releaseDir := t.TempDir()
+	releaseArtifact := func(name string) string {
+		path := filepath.Join(releaseDir, name)
+		if err := os.WriteFile(path, []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, gate := range []reviewtransaction.GateKind{
+		reviewtransaction.GatePostApply, reviewtransaction.GatePreCommit, reviewtransaction.GatePrePush,
+		reviewtransaction.GatePrePR, reviewtransaction.GateRelease,
+	} {
+		t.Run(string(gate), func(t *testing.T) {
+			input := reviewtransaction.NativeGateRequestInput{Gate: gate}
+			if gate == reviewtransaction.GateRelease {
+				input.ReleaseConfiguration = releaseArtifact("configuration")
+				input.ReleaseGenerated = releaseArtifact("generated")
+				input.ReleaseProvenance = releaseArtifact("provenance")
+				input.ReleasePublicationBoundary = releaseArtifact("publication")
+				input.ReleaseEvidenceFreshness = releaseArtifact("freshness")
+			}
+			governs, _, evaluation, discoveryErr := resolveGoverningAuthority(context.Background(), repo, lineage, input)
+			if !governs || discoveryErr != nil || evaluation.Result != reviewtransaction.GateAllow {
+				t.Fatalf("approved authority with a valid receipt must allow exact candidate, got governs=%v evaluation=%#v discoveryErr=%v", governs, evaluation, discoveryErr)
+			}
+		})
+	}
 }
 
-// TestResolveGoverningAuthorityCandidateIdentityMismatchDenies is absorbed
-// N3 (W3/W4 verify): the receipt cross-check at
-// review_governing_authority.go's `approved` case compared only LineageID,
-// AuthorityRevision, and TerminalState — never CandidateIdentity. A receipt
-// on disk whose candidate_identity has been tampered with (or corrupted)
-// while LineageID/AuthorityRevision/TerminalState still happen to match the
-// authority record passed this cross-check and reached GateAllow. This
-// pins the fix: the receipt's CandidateIdentity must also match the
-// authority record's frozen CandidateIdentity, or the gate denies exactly
-// like every other receipt-integrity gap (reviewFacadeReceiptNotAvailableReason,
-// approved_without_receipt).
 func TestResolveGoverningAuthorityCandidateIdentityMismatchDenies(t *testing.T) {
 	reviewModeHome(t)
 	repo := initReviewCLIRepo(t)
@@ -265,6 +296,7 @@ func TestResolveGoverningAuthorityCandidateIdentityMismatchDenies(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := providerDigestForStore(t, store)
 	// Write a genuinely valid receipt first (proving WriteReceipt itself
 	// still enforces the matching CandidateIdentity at issuance time), then
 	// tamper with the published bytes directly on disk — the same technique
@@ -274,7 +306,7 @@ func TestResolveGoverningAuthorityCandidateIdentityMismatchDenies(t *testing.T) 
 	if err := store.WriteReceipt(context.Background(), reviewtransaction.NewLineageReceipt{
 		Schema: reviewtransaction.NewLineageReceiptSchema, LineageID: lineage,
 		TerminalState: reviewtransaction.NewLineageStateApproved, AuthorityRevision: revision,
-		CandidateIdentity: live,
+		CandidateIdentity: live, ProviderCausalAggregateDigest: digest,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +315,7 @@ func TestResolveGoverningAuthorityCandidateIdentityMismatchDenies(t *testing.T) 
 	tamperedReceipt := reviewtransaction.NewLineageReceipt{
 		Schema: reviewtransaction.NewLineageReceiptSchema, LineageID: lineage,
 		TerminalState: reviewtransaction.NewLineageStateApproved, AuthorityRevision: revision,
-		CandidateIdentity: tampered,
+		CandidateIdentity: tampered, ProviderCausalAggregateDigest: digest,
 	}
 	payload, err := json.MarshalIndent(tamperedReceipt, "", "  ")
 	if err != nil {
@@ -347,10 +379,11 @@ func TestResolveGoverningAuthorityCorruptReceiptNamesFreshLineageNotFinalize(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := providerDigestForStore(t, store)
 	if err := store.WriteReceipt(context.Background(), reviewtransaction.NewLineageReceipt{
 		Schema: reviewtransaction.NewLineageReceiptSchema, LineageID: lineage,
 		TerminalState: reviewtransaction.NewLineageStateApproved, AuthorityRevision: revision,
-		CandidateIdentity: live,
+		CandidateIdentity: live, ProviderCausalAggregateDigest: digest,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +392,7 @@ func TestResolveGoverningAuthorityCorruptReceiptNamesFreshLineageNotFinalize(t *
 	tamperedPayload, err := json.MarshalIndent(reviewtransaction.NewLineageReceipt{
 		Schema: reviewtransaction.NewLineageReceiptSchema, LineageID: lineage,
 		TerminalState: reviewtransaction.NewLineageStateApproved, AuthorityRevision: revision,
-		CandidateIdentity: tampered,
+		CandidateIdentity: tampered, ProviderCausalAggregateDigest: digest,
 	}, "", "  ")
 	if err != nil {
 		t.Fatal(err)
