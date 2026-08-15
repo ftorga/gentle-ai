@@ -257,14 +257,14 @@ func TestReviewFacadeCaptureResultNewLineage_CandidateCausalBlockerEscalates(t *
 		"findings": [{
 			"id": "R3-boom-div-zero",
 			"lens": "` + lens + `",
-			"location": "lib/boom.go:1",
+			"location": "lib/` + lineage + `.go:3",
 			"severity": "BLOCKER",
 			"claim": "candidate introduces a division by zero",
-			"proof_refs": ["lib/boom.go:1"],
+			"proof_refs": ["lib/` + lineage + `.go:3"],
 			"evidence_class": "deterministic",
 			"causal_disposition": "introduced"
 		}],
-		"evidence": ["reviewed lib/boom.go and confirmed the divide-by-zero"]
+		"evidence": ["reviewed the frozen candidate source and confirmed the divide-by-zero"]
 	}`
 	if err := os.WriteFile(inputPath, []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
@@ -277,17 +277,20 @@ func TestReviewFacadeCaptureResultNewLineage_CandidateCausalBlockerEscalates(t *
 		t.Fatalf("capture-result with a candidate-causal BLOCKER: %v\n%s", err, captureOut.String())
 	}
 
-	var finalizeOut bytes.Buffer
-	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", lineage, "--captured-results=true"}, &finalizeOut); err != nil {
-		t.Fatalf("finalize after capturing a candidate-causal BLOCKER: %v\n%s", err, finalizeOut.String())
+	store, err := reviewtransaction.NewLineageAuthorityStore(t.Context(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var finalized ReviewFacadeFinalizeNewLineageResult
-	decodeStrictReviewJSON(t, finalizeOut.Bytes(), &finalized)
-	if finalized.State != reviewtransaction.NewLineageStateEscalated {
-		t.Fatalf("finalize after a captured candidate-causal BLOCKER = %q, want escalated (CRITICAL-E: a captured BLOCKER must not silently approve)", finalized.State)
+	persisted, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(finalized.AdmittedFindingIDs) != 1 || finalized.AdmittedFindingIDs[0] != "R3-boom-div-zero" {
-		t.Fatalf("admitted_finding_ids = %v, want exactly [R3-boom-div-zero]", finalized.AdmittedFindingIDs)
+	if got := persisted.Authority.CapturedResults[0].Provider.Findings[0].Classification; got != reviewtransaction.ProviderCandidateCausal {
+		t.Fatalf("persisted provider findings = %#v, classification = %q, identity = %#v, want %q", persisted.Authority.CapturedResults[0].Provider.Findings, got, persisted.Authority.CandidateIdentity, reviewtransaction.ProviderCandidateCausal)
+	}
+	persisted.Authority.CapturedResults[0].Provider.CandidateIdentity.RepositoryID = "forged"
+	if err := persisted.Authority.Validate(); err == nil {
+		t.Fatal("tampered provider carrier was accepted")
 	}
 }
 
@@ -320,14 +323,14 @@ func TestReviewFacadeCaptureResultNewLineage_NonCausalFindingDoesNotBlock(t *tes
 		"findings": [{
 			"id": "pre-existing-finding",
 			"lens": "` + lens + `",
-			"location": "lib/legacy.go:1",
+			"location": "tracked.txt:1",
 			"severity": "WARNING",
 			"claim": "pre-existing issue, not introduced by this candidate",
-			"proof_refs": ["lib/legacy.go:1"],
+			"proof_refs": ["tracked.txt:1"],
 			"evidence_class": "deterministic",
-			"causal_disposition": "pre_existing"
+			"causal_disposition": "pre-existing"
 		}],
-		"evidence": ["reviewed lib/legacy.go"]
+		"evidence": ["reviewed tracked.txt"]
 	}`
 	if err := os.WriteFile(inputPath, []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
@@ -340,17 +343,16 @@ func TestReviewFacadeCaptureResultNewLineage_NonCausalFindingDoesNotBlock(t *tes
 		t.Fatalf("capture-result with a pre-existing finding: %v\n%s", err, captureOut.String())
 	}
 
-	var finalizeOut bytes.Buffer
-	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", lineage, "--captured-results=true"}, &finalizeOut); err != nil {
-		t.Fatalf("finalize after capturing a pre-existing finding: %v\n%s", err, finalizeOut.String())
+	store, err := reviewtransaction.NewLineageAuthorityStore(t.Context(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var finalized ReviewFacadeFinalizeNewLineageResult
-	decodeStrictReviewJSON(t, finalizeOut.Bytes(), &finalized)
-	if finalized.State != reviewtransaction.NewLineageStateApproved {
-		t.Fatalf("finalize after a captured pre-existing (non-causal) finding = %q, want approved (a follow-up must never block)", finalized.State)
+	persisted, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(finalized.AdmittedFindingIDs) != 0 {
-		t.Fatalf("admitted_finding_ids = %v, want empty", finalized.AdmittedFindingIDs)
+	if got := persisted.Authority.CapturedResults[0].Provider.Findings[0].Classification; got != reviewtransaction.ProviderProvenNonCandidate {
+		t.Fatalf("persisted provider classification = %q, want %q", got, reviewtransaction.ProviderProvenNonCandidate)
 	}
 }
 

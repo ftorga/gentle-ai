@@ -1,0 +1,219 @@
+package reviewtransaction
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type ProviderCausalClassification string
+
+const (
+	ProviderCandidateCausal    ProviderCausalClassification = "candidate-causal"
+	ProviderProvenNonCandidate ProviderCausalClassification = "proven-non-candidate"
+	ProviderUnknown            ProviderCausalClassification = "unknown"
+)
+
+var providerDiffHunk = regexp.MustCompile(`(?m)^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+type ProviderCausalEvidence struct {
+	FindingID          string   `json:"finding_id"`
+	Location           string   `json:"location"`
+	ProofRefs          []string `json:"proof_refs"`
+	ClaimedDisposition string   `json:"claimed_disposition,omitempty"`
+}
+
+type ProviderCausalFinding struct {
+	FindingID      string                       `json:"finding_id"`
+	Location       string                       `json:"location"`
+	ProofRefs      []string                     `json:"proof_refs"`
+	Classification ProviderCausalClassification `json:"classification"`
+	EvidenceDigest string                       `json:"evidence_digest"`
+}
+type ProviderCausalCarrier struct {
+	SubjectHash       string                  `json:"subject_hash"`
+	CandidateIdentity CandidateIdentity       `json:"candidate_identity"`
+	Findings          []ProviderCausalFinding `json:"findings"`
+	AggregateDigest   string                  `json:"aggregate_digest"`
+}
+type ProviderCausalFailure struct {
+	Kind, Operation string
+	Cause           error
+}
+
+func (e *ProviderCausalFailure) Error() string {
+	return fmt.Sprintf("provider causal %s failure during %s: %v", e.Kind, e.Operation, e.Cause)
+}
+func (e *ProviderCausalFailure) Unwrap() error { return e.Cause }
+func (c ProviderCausalCarrier) Validate() error {
+	if !validSHA256(c.SubjectHash) {
+		return errors.New("provider causal carrier requires a canonical subject hash")
+	}
+	for i, f := range c.Findings {
+		if f.FindingID == "" || (i > 0 && f.FindingID <= c.Findings[i-1].FindingID) {
+			return errors.New("provider causal carrier findings must be unique and canonical")
+		}
+		if f.Classification != ProviderCandidateCausal && f.Classification != ProviderProvenNonCandidate && f.Classification != ProviderUnknown {
+			return errors.New("provider causal carrier classification is unsupported")
+		}
+		if f.Classification == ProviderCandidateCausal && len(f.ProofRefs) == 0 {
+			return errors.New("provider causal carrier candidate-causal findings require proof refs")
+		}
+		if f.EvidenceDigest != providerFindingDigest(f) {
+			return errors.New("provider causal carrier finding digest does not match its content")
+		}
+	}
+	if c.AggregateDigest != providerAggregateDigest(c) {
+		return errors.New("provider causal carrier aggregate digest does not match its findings")
+	}
+	return nil
+}
+func canonicalProviderProofRefs(refs []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range refs {
+		r = strings.TrimSpace(r)
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+func canonicalProviderClaims(in []ProviderCausalEvidence) ([]ProviderCausalEvidence, error) {
+	out := append([]ProviderCausalEvidence(nil), in...)
+	for i := range out {
+		out[i].FindingID = strings.TrimSpace(out[i].FindingID)
+		out[i].Location = strings.TrimSpace(out[i].Location)
+		out[i].ProofRefs = canonicalProviderProofRefs(out[i].ProofRefs)
+		if out[i].FindingID == "" {
+			return nil, errors.New("provider causal evidence requires a finding id")
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FindingID < out[j].FindingID })
+	for i := 1; i < len(out); i++ {
+		if out[i].FindingID == out[i-1].FindingID && (out[i].Location != out[i-1].Location || !equalStrings(out[i].ProofRefs, out[i-1].ProofRefs)) {
+			return nil, errors.New("provider causal evidence contains conflicting duplicate finding id")
+		}
+	}
+	dedup := out[:0]
+	for _, v := range out {
+		if len(dedup) == 0 || dedup[len(dedup)-1].FindingID != v.FindingID {
+			dedup = append(dedup, v)
+		}
+	}
+	return dedup, nil
+}
+func providerFindingDigest(f ProviderCausalFinding) string {
+	b, _ := json.Marshal([]any{f.FindingID, f.Location, f.ProofRefs, f.Classification})
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(append([]byte("gentle-ai.provider-causal-finding/v1\x00"), b...)))
+}
+func providerAggregateDigest(c ProviderCausalCarrier) string {
+	ids := make([]string, len(c.Findings))
+	for i, f := range c.Findings {
+		ids[i] = f.EvidenceDigest
+	}
+	b, _ := json.Marshal([]any{c.SubjectHash, c.CandidateIdentity, ids})
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(append([]byte("gentle-ai.provider-causal-aggregate/v1\x00"), b...)))
+}
+func DeriveProviderCausalCarrier(ctx context.Context, repo, subject string, candidate CandidateIdentity, claims []ProviderCausalEvidence) (ProviderCausalCarrier, error) {
+	if !validSHA256(subject) || !validGitTree(candidate.BaseTree) || !validGitTree(candidate.CandidateTree) {
+		return ProviderCausalCarrier{}, errors.New("provider causal derivation requires a valid subject and frozen candidate trees")
+	}
+	claims, err := canonicalProviderClaims(claims)
+	if err != nil {
+		return ProviderCausalCarrier{}, &ProviderCausalFailure{"capture", "canonicalize provider claims", err}
+	}
+	c := ProviderCausalCarrier{SubjectHash: subject, CandidateIdentity: candidate, Findings: make([]ProviderCausalFinding, 0, len(claims))}
+	for _, claim := range claims {
+		class := ProviderUnknown
+		if claim.Location != "" {
+			proof, err := providerProofRefsValid(ctx, repo, candidate, claim.ProofRefs)
+			if err != nil {
+				return ProviderCausalCarrier{}, err
+			}
+			changed, err := providerCandidateLineChanged(ctx, repo, candidate, claim.Location)
+			if err != nil {
+				return ProviderCausalCarrier{}, err
+			}
+			if changed && proof {
+				class = ProviderCandidateCausal
+			} else if !changed {
+				same, err := providerWholePathEqual(ctx, repo, candidate, claim.Location)
+				if err != nil {
+					return ProviderCausalCarrier{}, err
+				}
+				if same {
+					class = ProviderProvenNonCandidate
+				}
+			}
+		}
+		f := ProviderCausalFinding{FindingID: claim.FindingID, Location: claim.Location, ProofRefs: claim.ProofRefs, Classification: class}
+		f.EvidenceDigest = providerFindingDigest(f)
+		c.Findings = append(c.Findings, f)
+	}
+	c.AggregateDigest = providerAggregateDigest(c)
+	return c, nil
+}
+func providerProofRefsValid(ctx context.Context, repo string, c CandidateIdentity, refs []string) (bool, error) {
+	if len(refs) == 0 {
+		return false, nil
+	}
+	for _, r := range refs {
+		p, e := parseFindingLocation(r)
+		if e != nil || p.StartLine < 1 {
+			return false, nil
+		}
+		b, x := runGit(ctx, repo, nil, nil, "show", c.CandidateTree+":"+p.Path)
+		if x != nil {
+			return false, &ProviderCausalFailure{"infrastructure", "read frozen proof ref", x}
+		}
+		if p.StartLine > len(strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+func providerCandidateLineChanged(ctx context.Context, repo string, c CandidateIdentity, loc string) (bool, error) {
+	p, e := parseFindingLocation(loc)
+	if e != nil {
+		return false, e
+	}
+	b, e := runGit(ctx, repo, nil, nil, "diff", "--unified=0", "--no-renames", "--no-ext-diff", "--no-textconv", c.BaseTree, c.CandidateTree, "--", literalPathspec(p.Path))
+	if e != nil {
+		return false, &ProviderCausalFailure{"infrastructure", "read frozen candidate line", e}
+	}
+	for _, m := range providerDiffHunk.FindAllSubmatch(b, -1) {
+		s, _ := strconv.Atoi(string(m[1]))
+		n := 1
+		if len(m[2]) > 0 {
+			n, _ = strconv.Atoi(string(m[2]))
+		}
+		if n > 0 && p.StartLine >= s && p.StartLine < s+n {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+func providerWholePathEqual(ctx context.Context, repo string, c CandidateIdentity, loc string) (bool, error) {
+	p, e := parseFindingLocation(loc)
+	if e != nil {
+		return false, e
+	}
+	a, e := runGit(ctx, repo, nil, nil, "show", c.BaseTree+":"+p.Path)
+	if e != nil {
+		return false, &ProviderCausalFailure{"infrastructure", "read frozen base path", e}
+	}
+	b, e := runGit(ctx, repo, nil, nil, "show", c.CandidateTree+":"+p.Path)
+	if e != nil {
+		return false, &ProviderCausalFailure{"infrastructure", "read frozen candidate path", e}
+	}
+	return p.StartLine > 0 && string(a) == string(b), nil
+}

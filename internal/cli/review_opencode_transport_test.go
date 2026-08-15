@@ -49,6 +49,8 @@ func TestOpenCodeReviewTransportRelaysOneLiveTaskAndCapturesHostOutput(t *testin
 		mustFrozenContext(t, repo, record), mustArtifactSubject(t, repo, record, lens, 0)); err != nil || !found {
 		t.Fatalf("captured provider result found=%v err=%v", found, err)
 	}
+
+	raw = bytes.Replace(raw, []byte(`"lens":"`+lens+`",`), nil, 1)
 }
 
 func TestOpenCodeReviewTransportPublishesProvenanceOnlyAfterDurableCapture(t *testing.T) {

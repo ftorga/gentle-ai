@@ -1022,6 +1022,19 @@ func newLineageCapturedFindings(findings []facadeFinding) []reviewtransaction.Fi
 	return converted
 }
 
+func newLineageProviderClaims(result facadeReviewerResult) ([]reviewtransaction.ProviderCausalEvidence, error) {
+	canonical, err := reviewtransaction.CanonicalCompactLensResult(result.nativeLensResult())
+	if err != nil {
+		return nil, err
+	}
+	claims := make([]reviewtransaction.ProviderCausalEvidence, len(canonical.Findings))
+	for index, finding := range canonical.Findings {
+		claims[index] = reviewtransaction.ProviderCausalEvidence{FindingID: finding.ID, Location: finding.Location,
+			ProofRefs: append([]string(nil), finding.ProofRefs...), ClaimedDisposition: string(finding.CausalDisposition)}
+	}
+	return claims, nil
+}
+
 // runReviewFacadeCaptureResultNewLineage is C-A's CLI wiring for the minimal
 // v3 capture primitive (reviewtransaction.AuthorityStore.CaptureLensResult).
 // --preflight derives and returns the exact provider-owned subject hash
@@ -1073,6 +1086,14 @@ func runReviewFacadeCaptureResultNewLineage(
 	if result.Findings == nil || result.Evidence == nil {
 		return reviewPreflightError(errors.New("reviewer result requires explicit findings and evidence arrays"))
 	}
+	if result.Lens == "" {
+		result.Lens = lens
+	}
+	for index := range result.Findings {
+		if result.Findings[index].Lens == "" {
+			result.Findings[index].Lens = lens
+		}
+	}
 	if err := reviewtransaction.ValidateNewLineageLensResult(authority, lens, order, result.SubjectHash, newLineageCapturedFindings(result.Findings)); err != nil {
 		return reviewPreflightError(err)
 	}
@@ -1086,7 +1107,11 @@ func runReviewFacadeCaptureResultNewLineage(
 	if err != nil {
 		return err
 	}
-	if _, err := store.CaptureLensResult(ctx, record.Revision, lens, order, result.SubjectHash, newLineageCapturedFindings(result.Findings)); err != nil {
+	claims, err := newLineageProviderClaims(result)
+	if err != nil {
+		return reviewPreflightError(fmt.Errorf("canonicalize reviewer result: %w", err))
+	}
+	if _, err := store.CaptureLensResultWithProviderEvidence(ctx, record.Revision, lens, order, result.SubjectHash, claims); err != nil {
 		return reviewPreflightError(err)
 	}
 	return encodeReviewJSON(stdout, ReviewFacadeCaptureResultNewLineageResult{

@@ -119,6 +119,14 @@ func reviewProviderAdmitRaw(ctx context.Context, root string, state reviewtransa
 	if err := decodeFacadeJSONBytes(payload, &result); err != nil {
 		return reviewProviderAdmittedResult{}, fmt.Errorf("decode reviewer result: %w", err)
 	}
+	if result.Lens == "" {
+		result.Lens = subject.Lens
+	}
+	for index := range result.Findings {
+		if result.Findings[index].Lens == "" {
+			result.Findings[index].Lens = subject.Lens
+		}
+	}
 	if result.Findings == nil || result.Evidence == nil {
 		return reviewProviderAdmittedResult{}, errors.New("reviewer result requires explicit findings and evidence arrays") // refusal:by-design operator-knowledge: reviewers must resubmit explicit findings and evidence arrays
 	}
@@ -143,7 +151,7 @@ func reviewProviderAdmitRaw(ctx context.Context, root string, state reviewtransa
 		return reviewProviderAdmittedResult{}, err
 	}
 	canonicalPayload = append(canonicalPayload, '\n')
-	native := reviewtransaction.LensResult{Lens: canonical.Lens, Findings: canonical.Findings, Evidence: canonical.Evidence}
+	native := reviewtransaction.LensResult{Lens: subject.Lens, Findings: canonical.Findings, Evidence: canonical.Evidence}
 	canonicalForCausality, err := reviewtransaction.CanonicalCompactLensResult(native)
 	if err != nil {
 		return reviewProviderAdmittedResult{}, fmt.Errorf("canonicalize reviewer result: %w", err)

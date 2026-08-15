@@ -289,3 +289,21 @@ func TestCaptureLensResult_RefusesSevereFindingMissingEvidenceOrCausality(t *tes
 		}
 	})
 }
+func TestDeriveProviderCausalCarrierRejectsUnreadableFrozenProof(t *testing.T) {
+	if _, err := DeriveProviderCausalCarrier(context.Background(), initSnapshotRepo(t), hash("a"), CandidateIdentity{BaseTree: strings.Repeat("a", 64), CandidateTree: strings.Repeat("b", 64)}, []ProviderCausalEvidence{{FindingID: "finding", Location: "tracked.txt:1", ProofRefs: []string{"tracked.txt:1"}}}); err == nil || !strings.Contains(err.Error(), "read frozen proof ref") {
+		t.Fatal("unreadable frozen proof did not return its infrastructure error")
+	}
+}
+
+func TestDeriveProviderCausalCarrierAcceptsCandidateAddedProof(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	base := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	writeSnapshotFile(t, repo, "added.txt", "proof\n")
+	gitSnapshot(t, repo, "add", "added.txt")
+	gitSnapshot(t, repo, "commit", "-m", "candidate")
+	candidate := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	carrier, err := DeriveProviderCausalCarrier(context.Background(), repo, hash("a"), CandidateIdentity{BaseTree: base, CandidateTree: candidate}, []ProviderCausalEvidence{{FindingID: "finding", Location: "added.txt:1", ProofRefs: []string{"added.txt:1"}}})
+	if err != nil || carrier.Findings[0].Classification != ProviderCandidateCausal {
+		t.Fatalf("candidate-added proof = %#v, %v", carrier, err)
+	}
+}

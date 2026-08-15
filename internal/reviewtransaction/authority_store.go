@@ -119,10 +119,11 @@ type NewLineageAuthority struct {
 // no reopen) -- only the findings themselves, fed into the existing
 // AdmitCandidateCausalFindings at finalize time.
 type NewLineageCapturedResult struct {
-	Lens        string            `json:"lens"`
-	Order       int               `json:"order"`
-	SubjectHash string            `json:"subject_hash"`
-	Findings    []FindingEvidence `json:"findings,omitempty"`
+	Lens        string                `json:"lens"`
+	Order       int                   `json:"order"`
+	SubjectHash string                `json:"subject_hash"`
+	Findings    []FindingEvidence     `json:"findings,omitempty"`
+	Provider    ProviderCausalCarrier `json:"provider_causal,omitempty"`
 }
 
 // CapturedLensNames returns the plain lens-name list
@@ -166,7 +167,17 @@ func (authority NewLineageAuthority) MissingCapturedLensNames() []string {
 func (authority NewLineageAuthority) CapturedFindingEvidence() []FindingEvidence {
 	var findings []FindingEvidence
 	for _, captured := range authority.CapturedResults {
-		findings = append(findings, captured.Findings...)
+		if captured.Provider.SubjectHash != "" || captured.Provider.CandidateIdentity != (CandidateIdentity{}) || len(captured.Provider.Findings) > 0 || captured.Provider.AggregateDigest != "" {
+			for _, finding := range captured.Provider.Findings {
+				causality := map[ProviderCausalClassification]CausalDisposition{ProviderCandidateCausal: CausalIntroduced, ProviderProvenNonCandidate: CausalPreExisting}[finding.Classification]
+				if causality == "" {
+					causality = CausalUnknown
+				}
+				findings = append(findings, FindingEvidence{FindingID: finding.FindingID, Causality: causality})
+			}
+		} else {
+			findings = append(findings, captured.Findings...)
+		}
 	}
 	return findings
 }
@@ -215,6 +226,9 @@ func (authority NewLineageAuthority) Validate() error {
 		if strings.TrimSpace(captured.Lens) == "" || captured.Order < 0 || !validSHA256(captured.SubjectHash) {
 			return errors.New("new-lineage authority captured results must carry a non-empty lens, a non-negative order, and a canonical subject hash") // refusal:by-design world-action: captured results are only ever written by AuthorityStore.CaptureLensResult after validating them; malformed entries here mean in-process corruption, not something an operator command repairs
 		}
+		if captured.Order >= len(authority.SelectedLenses) || authority.SelectedLenses[captured.Order] != captured.Lens || captured.SubjectHash != NewLineageArtifactSubjectHash(authority, captured.Lens, captured.Order) {
+			return errors.New("new-lineage authority captured result binding does not match the frozen candidate")
+		}
 		if seenCapturedLenses[captured.Lens] {
 			return errors.New("new-lineage authority captured results must name each lens at most once") // refusal:by-design world-action: CaptureLensResult enforces one-shot-per-lens before ever appending; a duplicate here means in-process corruption, not something an operator command repairs
 		}
@@ -222,6 +236,15 @@ func (authority NewLineageAuthority) Validate() error {
 		for _, finding := range captured.Findings {
 			if strings.TrimSpace(finding.FindingID) == "" {
 				return errors.New("new-lineage authority captured findings must carry a non-empty finding id") // refusal:by-design world-action: captured findings are only ever written by AuthorityStore.CaptureLensResult from an already-decoded reviewer result; a malformed entry here means in-process corruption, not something an operator command repairs
+			}
+		}
+		provider := captured.Provider
+		if provider.SubjectHash != "" || provider.CandidateIdentity != (CandidateIdentity{}) || len(provider.Findings) > 0 || provider.AggregateDigest != "" {
+			if provider.SubjectHash != captured.SubjectHash || provider.CandidateIdentity != authority.CandidateIdentity {
+				return errors.New("new-lineage authority provider carrier does not match the frozen candidate")
+			}
+			if err := provider.Validate(); err != nil {
+				return fmt.Errorf("validate persisted provider carrier: %w", err)
 			}
 		}
 	}
