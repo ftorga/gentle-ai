@@ -294,16 +294,19 @@ func TestDeriveProviderCausalCarrierRejectsUnreadableFrozenProof(t *testing.T) {
 		t.Fatal("unreadable frozen proof did not return its infrastructure error")
 	}
 }
-
-func TestDeriveProviderCausalCarrierAcceptsCandidateAddedProof(t *testing.T) {
+func TestDeriveProviderCausalCarrierChecksCandidateProofBoundsAndChangedRangeEnd(t *testing.T) {
 	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "unchanged\nbase\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "base")
 	base := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
-	writeSnapshotFile(t, repo, "added.txt", "proof\n")
-	gitSnapshot(t, repo, "add", "added.txt")
+	writeSnapshotFile(t, repo, "tracked.txt", "unchanged\ncandidate\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
 	gitSnapshot(t, repo, "commit", "-m", "candidate")
 	candidate := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
-	carrier, err := DeriveProviderCausalCarrier(context.Background(), repo, hash("a"), CandidateIdentity{BaseTree: base, CandidateTree: candidate}, []ProviderCausalEvidence{{FindingID: "finding", Location: "added.txt:1", ProofRefs: []string{"added.txt:1"}}})
-	if err != nil || carrier.Findings[0].Classification != ProviderCandidateCausal {
-		t.Fatalf("candidate-added proof = %#v, %v", carrier, err)
+	for proof, want := range map[string]ProviderCausalClassification{"tracked.txt:1-2": ProviderCandidateCausal, "tracked.txt:1-3": ProviderUnknown} {
+		if carrier, err := DeriveProviderCausalCarrier(context.Background(), repo, hash("a"), CandidateIdentity{BaseTree: base, CandidateTree: candidate}, []ProviderCausalEvidence{{FindingID: "finding", Location: "tracked.txt:1-2", ProofRefs: []string{proof}}}); err != nil || carrier.Findings[0].Classification != want {
+			t.Fatalf("proof = %#v, %v", carrier, err)
+		}
 	}
 }

@@ -23,12 +23,10 @@ const (
 var providerDiffHunk = regexp.MustCompile(`(?m)^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
 type ProviderCausalEvidence struct {
-	FindingID          string   `json:"finding_id"`
-	Location           string   `json:"location"`
-	ProofRefs          []string `json:"proof_refs"`
-	ClaimedDisposition string   `json:"claimed_disposition,omitempty"`
+	FindingID string   `json:"finding_id"`
+	Location  string   `json:"location"`
+	ProofRefs []string `json:"proof_refs"`
 }
-
 type ProviderCausalFinding struct {
 	FindingID      string                       `json:"finding_id"`
 	Location       string                       `json:"location"`
@@ -53,24 +51,24 @@ func (e *ProviderCausalFailure) Error() string {
 func (e *ProviderCausalFailure) Unwrap() error { return e.Cause }
 func (c ProviderCausalCarrier) Validate() error {
 	if !validSHA256(c.SubjectHash) {
-		return errors.New("provider causal carrier requires a canonical subject hash")
+		return errors.New("provider causal carrier requires a canonical subject hash") // refusal:by-design world-action: immutable carrier bytes with an invalid subject cannot be repaired safely by an operator command
 	}
 	for i, f := range c.Findings {
 		if f.FindingID == "" || (i > 0 && f.FindingID <= c.Findings[i-1].FindingID) {
-			return errors.New("provider causal carrier findings must be unique and canonical")
+			return errors.New("provider causal carrier findings must be unique and canonical") // refusal:by-design world-action: immutable carrier findings cannot be canonicalized safely by an operator command
 		}
 		if f.Classification != ProviderCandidateCausal && f.Classification != ProviderProvenNonCandidate && f.Classification != ProviderUnknown {
-			return errors.New("provider causal carrier classification is unsupported")
+			return errors.New("provider causal carrier classification is unsupported") // refusal:by-design world-action: an unsupported provider classification requires corrected source evidence, not an operator command
 		}
 		if f.Classification == ProviderCandidateCausal && len(f.ProofRefs) == 0 {
-			return errors.New("provider causal carrier candidate-causal findings require proof refs")
+			return errors.New("provider causal carrier candidate-causal findings require proof refs") // refusal:by-design world-action: missing immutable proof cannot be invented by an operator command
 		}
 		if f.EvidenceDigest != providerFindingDigest(f) {
-			return errors.New("provider causal carrier finding digest does not match its content")
+			return errors.New("provider causal carrier finding digest does not match its content") // refusal:by-design world-action: an immutable digest mismatch cannot be repaired safely by an operator command
 		}
 	}
 	if c.AggregateDigest != providerAggregateDigest(c) {
-		return errors.New("provider causal carrier aggregate digest does not match its findings")
+		return errors.New("provider causal carrier aggregate digest does not match its findings") // refusal:by-design world-action: an immutable aggregate mismatch cannot be repaired safely by an operator command
 	}
 	return nil
 }
@@ -94,13 +92,13 @@ func canonicalProviderClaims(in []ProviderCausalEvidence) ([]ProviderCausalEvide
 		out[i].Location = strings.TrimSpace(out[i].Location)
 		out[i].ProofRefs = canonicalProviderProofRefs(out[i].ProofRefs)
 		if out[i].FindingID == "" {
-			return nil, errors.New("provider causal evidence requires a finding id")
+			return nil, errors.New("provider causal evidence requires a finding id") // refusal:by-design world-action: incomplete provider evidence requires a new source result, not an operator command
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FindingID < out[j].FindingID })
 	for i := 1; i < len(out); i++ {
 		if out[i].FindingID == out[i-1].FindingID && (out[i].Location != out[i-1].Location || !equalStrings(out[i].ProofRefs, out[i-1].ProofRefs)) {
-			return nil, errors.New("provider causal evidence contains conflicting duplicate finding id")
+			return nil, errors.New("provider causal evidence contains conflicting duplicate finding id") // refusal:by-design world-action: conflicting provider evidence requires a new source result, not an operator command
 		}
 	}
 	dedup := out[:0]
@@ -125,7 +123,7 @@ func providerAggregateDigest(c ProviderCausalCarrier) string {
 }
 func DeriveProviderCausalCarrier(ctx context.Context, repo, subject string, candidate CandidateIdentity, claims []ProviderCausalEvidence) (ProviderCausalCarrier, error) {
 	if !validSHA256(subject) || !validGitTree(candidate.BaseTree) || !validGitTree(candidate.CandidateTree) {
-		return ProviderCausalCarrier{}, errors.New("provider causal derivation requires a valid subject and frozen candidate trees")
+		return ProviderCausalCarrier{}, errors.New("provider causal derivation requires a valid subject and frozen candidate trees") // refusal:by-design world-action: caller-supplied frozen identity must be valid before derivation and cannot be repaired by an operator command
 	}
 	claims, err := canonicalProviderClaims(claims)
 	if err != nil {
@@ -139,20 +137,14 @@ func DeriveProviderCausalCarrier(ctx context.Context, repo, subject string, cand
 			if err != nil {
 				return ProviderCausalCarrier{}, err
 			}
-			changed, err := providerCandidateLineChanged(ctx, repo, candidate, claim.Location)
+			changed, same, err := providerCandidateLineChanged(ctx, repo, candidate, claim.Location)
 			if err != nil {
 				return ProviderCausalCarrier{}, err
 			}
 			if changed && proof {
 				class = ProviderCandidateCausal
-			} else if !changed {
-				same, err := providerWholePathEqual(ctx, repo, candidate, claim.Location)
-				if err != nil {
-					return ProviderCausalCarrier{}, err
-				}
-				if same {
-					class = ProviderProvenNonCandidate
-				}
+			} else if same {
+				class = ProviderProvenNonCandidate
 			}
 		}
 		f := ProviderCausalFinding{FindingID: claim.FindingID, Location: claim.Location, ProofRefs: claim.ProofRefs, Classification: class}
@@ -175,20 +167,24 @@ func providerProofRefsValid(ctx context.Context, repo string, c CandidateIdentit
 		if x != nil {
 			return false, &ProviderCausalFailure{"infrastructure", "read frozen proof ref", x}
 		}
-		if p.StartLine > len(strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")) {
+		lineCount := len(strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"))
+		if len(b) == 0 {
+			lineCount = 0
+		}
+		if p.StartLine > lineCount || p.EndLine > lineCount {
 			return false, nil
 		}
 	}
 	return true, nil
 }
-func providerCandidateLineChanged(ctx context.Context, repo string, c CandidateIdentity, loc string) (bool, error) {
+func providerCandidateLineChanged(ctx context.Context, repo string, c CandidateIdentity, loc string) (bool, bool, error) {
 	p, e := parseFindingLocation(loc)
 	if e != nil {
-		return false, e
+		return false, false, e
 	}
 	b, e := runGit(ctx, repo, nil, nil, "diff", "--unified=0", "--no-renames", "--no-ext-diff", "--no-textconv", c.BaseTree, c.CandidateTree, "--", literalPathspec(p.Path))
 	if e != nil {
-		return false, &ProviderCausalFailure{"infrastructure", "read frozen candidate line", e}
+		return false, false, &ProviderCausalFailure{"infrastructure", "read frozen candidate line", e}
 	}
 	for _, m := range providerDiffHunk.FindAllSubmatch(b, -1) {
 		s, _ := strconv.Atoi(string(m[1]))
@@ -196,24 +192,17 @@ func providerCandidateLineChanged(ctx context.Context, repo string, c CandidateI
 		if len(m[2]) > 0 {
 			n, _ = strconv.Atoi(string(m[2]))
 		}
-		if n > 0 && p.StartLine >= s && p.StartLine < s+n {
-			return true, nil
+		if n > 0 && p.StartLine < s+n && s <= p.EndLine {
+			return true, false, nil
 		}
-	}
-	return false, nil
-}
-func providerWholePathEqual(ctx context.Context, repo string, c CandidateIdentity, loc string) (bool, error) {
-	p, e := parseFindingLocation(loc)
-	if e != nil {
-		return false, e
 	}
 	a, e := runGit(ctx, repo, nil, nil, "show", c.BaseTree+":"+p.Path)
 	if e != nil {
-		return false, &ProviderCausalFailure{"infrastructure", "read frozen base path", e}
+		return false, false, &ProviderCausalFailure{"infrastructure", "read frozen base path", e}
 	}
-	b, e := runGit(ctx, repo, nil, nil, "show", c.CandidateTree+":"+p.Path)
+	candidateBytes, e := runGit(ctx, repo, nil, nil, "show", c.CandidateTree+":"+p.Path)
 	if e != nil {
-		return false, &ProviderCausalFailure{"infrastructure", "read frozen candidate path", e}
+		return false, false, &ProviderCausalFailure{"infrastructure", "read frozen candidate path", e}
 	}
-	return p.StartLine > 0 && string(a) == string(b), nil
+	return false, p.StartLine > 0 && string(a) == string(candidateBytes), nil
 }

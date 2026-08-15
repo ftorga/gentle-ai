@@ -1030,7 +1030,7 @@ func newLineageProviderClaims(result facadeReviewerResult) ([]reviewtransaction.
 	claims := make([]reviewtransaction.ProviderCausalEvidence, len(canonical.Findings))
 	for index, finding := range canonical.Findings {
 		claims[index] = reviewtransaction.ProviderCausalEvidence{FindingID: finding.ID, Location: finding.Location,
-			ProofRefs: append([]string(nil), finding.ProofRefs...), ClaimedDisposition: string(finding.CausalDisposition)}
+			ProofRefs: append([]string(nil), finding.ProofRefs...)}
 	}
 	return claims, nil
 }

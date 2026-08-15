@@ -25,6 +25,7 @@ func TestOpenCodeReviewTransportRelaysOneLiveTaskAndCapturesHostOutput(t *testin
 		t.Fatalf("relay prompt = %q", relay.prompt.Prompt)
 	}
 	raw := admittedReviewerPayloadForTest(t, repo, record, lens, 0)
+	raw = bytes.Replace(raw, []byte(`"lens":"`+lens+`",`), nil, 1)
 	hostOutput := `<task id="call-opaque" state="completed">
 <task_result>
 ` + string(raw) + `
@@ -38,19 +39,17 @@ func TestOpenCodeReviewTransportRelaysOneLiveTaskAndCapturesHostOutput(t *testin
 	}
 	var artifact reviewResultArtifact
 	decodeStrictReviewJSON(t, []byte(*completed.Output), &artifact)
-	if artifact.AdmissionDecision != reviewtransaction.ArtifactAdmissionCompleted || artifact.Reference == "" || artifact.Path != "" {
+	if artifact.AdmissionDecision != reviewtransaction.ArtifactAdmissionCompleted || artifact.Reference == "" || artifact.Path != "" || artifact.Lens != lens {
 		t.Fatalf("transport artifact = %#v", artifact)
 	}
 	if _, found := reviewtransaction.ReadLensContextEmission(store.Dir, record.State.LineageID, record.State.InitialSnapshot.Identity,
 		record.Revision, lens, 0, artifact.SubjectHash); !found {
 		t.Fatal("provider-contract context emission was not recorded after live Go relay capture")
 	}
-	if _, found, err := store.ResolveAdmittedReviewerResult(context.Background(), record.Revision, record.State.InitialSnapshot.Identity,
-		mustFrozenContext(t, repo, record), mustArtifactSubject(t, repo, record, lens, 0)); err != nil || !found {
-		t.Fatalf("captured provider result found=%v err=%v", found, err)
+	if result, found, err := store.ResolveAdmittedReviewerResult(context.Background(), record.Revision, record.State.InitialSnapshot.Identity,
+		mustFrozenContext(t, repo, record), mustArtifactSubject(t, repo, record, lens, 0)); err != nil || !found || result.Lens != lens {
+		t.Fatalf("captured provider result = %#v found=%v err=%v", result, found, err)
 	}
-
-	raw = bytes.Replace(raw, []byte(`"lens":"`+lens+`",`), nil, 1)
 }
 
 func TestOpenCodeReviewTransportPublishesProvenanceOnlyAfterDurableCapture(t *testing.T) {

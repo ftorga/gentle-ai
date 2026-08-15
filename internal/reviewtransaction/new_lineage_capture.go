@@ -104,21 +104,33 @@ var (
 //     subject hash AND identical findings is an idempotent replace (Mutate's
 //     own byte-identical no-op path); anything else for an already-captured
 //     lens is refused (ErrNewLineageCaptureConflict) -- there is no reopen.
-func (store AuthorityStore) CaptureLensResult(ctx context.Context, expectedRevision, lens string, order int, subjectHash string, findings []FindingEvidence) (NewLineageRecord, error) {
+func (store AuthorityStore) CaptureLensResult(ctx context.Context, expectedRevision, lens string, order int, subjectHash string, findings []FindingEvidence, provider ...ProviderCausalCarrier) (NewLineageRecord, error) {
+	if len(provider) > 1 {
+		return NewLineageRecord{}, errors.New("capture accepts at most one provider causal carrier") // refusal:by-design operator-knowledge: a capture result has one immutable provider carrier
+	}
 	if _, err := store.Mutate(ctx, expectedRevision, func(next *NewLineageAuthority) error {
 		normalizedFindings := append([]FindingEvidence(nil), findings...)
 		if err := ValidateNewLineageLensResult(*next, lens, order, subjectHash, normalizedFindings); err != nil {
 			return err
 		}
+		var carrier ProviderCausalCarrier
+		if len(provider) > 0 {
+			carrier = provider[0]
+			if carrier.SubjectHash != subjectHash || carrier.CandidateIdentity != next.CandidateIdentity || carrier.Validate() != nil {
+				return errors.New("provider causal carrier does not match capture binding") // refusal:by-design world-action: immutable provider evidence must remain bound to its frozen capture
+			}
+		}
 		for _, existing := range next.CapturedResults {
 			if existing.Lens != lens {
 				continue
 			}
-			return nil // validation permits only the idempotent existing result
+			if reflect.DeepEqual(existing.Provider, carrier) {
+				return nil // validation permits only the idempotent existing result
+			}
+			return fmt.Errorf("%w: lineage %q lens %q", ErrNewLineageCaptureConflict, next.LineageID, lens)
 		}
-		next.CapturedResults = append(append([]NewLineageCapturedResult(nil), next.CapturedResults...), NewLineageCapturedResult{
-			Lens: lens, Order: order, SubjectHash: subjectHash, Findings: normalizedFindings,
-		})
+		result := NewLineageCapturedResult{Lens: lens, Order: order, SubjectHash: subjectHash, Findings: normalizedFindings, Provider: carrier}
+		next.CapturedResults = append(append([]NewLineageCapturedResult(nil), next.CapturedResults...), result)
 		return nil
 	}); err != nil {
 		return NewLineageRecord{}, err
@@ -126,7 +138,6 @@ func (store AuthorityStore) CaptureLensResult(ctx context.Context, expectedRevis
 	return store.Load()
 }
 
-// CaptureLensResultWithProviderEvidence derives and persists the provider
 func (store AuthorityStore) CaptureLensResultWithProviderEvidence(ctx context.Context, expectedRevision, lens string, order int, subjectHash string, claims []ProviderCausalEvidence) (NewLineageRecord, error) {
 	record, err := store.Load()
 	if err != nil {
@@ -136,32 +147,7 @@ func (store AuthorityStore) CaptureLensResultWithProviderEvidence(ctx context.Co
 	if err != nil {
 		return NewLineageRecord{}, err
 	}
-	if _, err := store.Mutate(ctx, expectedRevision, func(next *NewLineageAuthority) error {
-		if next.State != NewLineageStateReviewing && next.State != NewLineageStateValidating {
-			return fmt.Errorf("%w: lineage %q is %q", ErrNewLineageCaptureNotReviewable, next.LineageID, next.State)
-		}
-		if order < 0 || order >= len(next.SelectedLenses) || next.SelectedLenses[order] != lens {
-			return fmt.Errorf("%w: lineage %q lens %q order %d", ErrNewLineageCaptureLensNotSelected, next.LineageID, lens, order)
-		}
-		want := NewLineageArtifactSubjectHash(*next, lens, order)
-		if subjectHash != want {
-			return fmt.Errorf("%w: lineage %q lens %q", ErrNewLineageCaptureSubjectMismatch, next.LineageID, lens)
-		}
-		for _, existing := range next.CapturedResults {
-			if existing.Lens != lens {
-				continue
-			}
-			if existing.SubjectHash == subjectHash && reflect.DeepEqual(existing.Provider, carrier) {
-				return nil
-			}
-			return fmt.Errorf("%w: lineage %q lens %q", ErrNewLineageCaptureConflict, next.LineageID, lens)
-		}
-		next.CapturedResults = append(next.CapturedResults, NewLineageCapturedResult{Lens: lens, Order: order, SubjectHash: subjectHash, Provider: carrier})
-		return nil
-	}); err != nil {
-		return NewLineageRecord{}, err
-	}
-	return store.Load()
+	return store.CaptureLensResult(ctx, expectedRevision, lens, order, subjectHash, nil, carrier)
 }
 
 // ValidateNewLineageLensResult applies the native admission checks without

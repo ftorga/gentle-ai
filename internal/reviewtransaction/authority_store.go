@@ -227,7 +227,7 @@ func (authority NewLineageAuthority) Validate() error {
 			return errors.New("new-lineage authority captured results must carry a non-empty lens, a non-negative order, and a canonical subject hash") // refusal:by-design world-action: captured results are only ever written by AuthorityStore.CaptureLensResult after validating them; malformed entries here mean in-process corruption, not something an operator command repairs
 		}
 		if captured.Order >= len(authority.SelectedLenses) || authority.SelectedLenses[captured.Order] != captured.Lens || captured.SubjectHash != NewLineageArtifactSubjectHash(authority, captured.Lens, captured.Order) {
-			return errors.New("new-lineage authority captured result binding does not match the frozen candidate")
+			return errors.New("new-lineage authority captured result binding does not match the frozen candidate") // refusal:by-design world-action: immutable persisted evidence cannot be rebound safely by an operator command
 		}
 		if seenCapturedLenses[captured.Lens] {
 			return errors.New("new-lineage authority captured results must name each lens at most once") // refusal:by-design world-action: CaptureLensResult enforces one-shot-per-lens before ever appending; a duplicate here means in-process corruption, not something an operator command repairs
@@ -241,7 +241,7 @@ func (authority NewLineageAuthority) Validate() error {
 		provider := captured.Provider
 		if provider.SubjectHash != "" || provider.CandidateIdentity != (CandidateIdentity{}) || len(provider.Findings) > 0 || provider.AggregateDigest != "" {
 			if provider.SubjectHash != captured.SubjectHash || provider.CandidateIdentity != authority.CandidateIdentity {
-				return errors.New("new-lineage authority provider carrier does not match the frozen candidate")
+				return errors.New("new-lineage authority provider carrier does not match the frozen candidate") // refusal:by-design world-action: immutable persisted evidence cannot be rebound safely by an operator command
 			}
 			if err := provider.Validate(); err != nil {
 				return fmt.Errorf("validate persisted provider carrier: %w", err)
