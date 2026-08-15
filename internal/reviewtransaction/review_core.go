@@ -156,41 +156,57 @@ func (core ReviewCore) finalize(authority NewLineageAuthority, request CoreReque
 		if err != nil {
 			return CoreTransition{}, err
 		}
+		providerDigest := ProviderCausalAggregateDigest(authority)
 		kind := CoreTransitionApprove
 		if authority.State == NewLineageStateEscalated {
 			kind = CoreTransitionEscalate
 		}
 		return CoreTransition{
 			Kind: kind, ReasonCode: string(authority.State),
-			Receipt: &ReceiptRef{LineageID: authority.LineageID, AuthorityRevision: revision},
+			Receipt: &ReceiptRef{LineageID: authority.LineageID, AuthorityRevision: revision, ProviderCausalAggregateDigest: providerDigest},
 		}, nil
 	case NewLineageStateReviewing, NewLineageStateCorrecting, NewLineageStateValidating:
 		if request.AdvanceRequest == nil {
 			return CoreTransition{}, fmt.Errorf("%w: got %q", ErrFinalizeRequiresTerminalState, authority.State)
 		}
-		escalating := request.AdvanceRequest.Failed || len(request.AdvanceRequest.AdmittedFindingIDs) > 0
-		if !escalating && !hasCapturedAllSelectedLenses(authority.SelectedLenses, request.AdvanceRequest.CapturedLensResults) {
+		if len(request.AdvanceRequest.AdmittedFindingIDs) > 0 {
+			return CoreTransition{}, ErrFinalizeRawAdmittedFindingIDs
+		}
+		if !request.AdvanceRequest.Failed && !hasCapturedAllSelectedLenses(authority.SelectedLenses, request.AdvanceRequest.CapturedLensResults) {
 			return CoreTransition{}, fmt.Errorf("%w: lineage %q", ErrFinalizeRequiresLensResults, authority.LineageID)
 		}
+		admitted := []string(nil)
+		providerUnknown := false
+		if !(request.AdvanceRequest.Failed && len(authority.CapturedResults) == 0 && len(authority.SelectedLenses) > 0) {
+			var err error
+			if request.AdvanceRequest.Failed {
+				admitted, providerUnknown, err = authority.ProviderCausalAdmissionPartial()
+			} else {
+				admitted, providerUnknown, err = authority.ProviderCausalAdmission()
+			}
+			if err != nil {
+				return CoreTransition{}, fmt.Errorf("verify persisted provider causal carrier: %w", err)
+			}
+		}
+		escalating := request.AdvanceRequest.Failed || providerUnknown || len(admitted) > 0
 		next := authority
 		next.State = NewLineageStateApproved
 		if escalating {
 			next.State = NewLineageStateEscalated
 		}
-		if len(request.AdvanceRequest.AdmittedFindingIDs) > 0 {
-			next.AdmittedFindingIDs = append(append([]string{}, next.AdmittedFindingIDs...), request.AdvanceRequest.AdmittedFindingIDs...)
-		}
+		next.AdmittedFindingIDs = append([]string(nil), admitted...)
 		revision, err := NewLineageRevisionForState(next)
 		if err != nil {
 			return CoreTransition{}, err
 		}
+		providerDigest := ProviderCausalAggregateDigest(next)
 		kind := CoreTransitionApprove
 		if next.State == NewLineageStateEscalated {
 			kind = CoreTransitionEscalate
 		}
 		return CoreTransition{
 			Kind: kind, ReasonCode: string(next.State), Authority: &next,
-			Receipt: &ReceiptRef{LineageID: next.LineageID, AuthorityRevision: revision},
+			Receipt: &ReceiptRef{LineageID: next.LineageID, AuthorityRevision: revision, ProviderCausalAggregateDigest: providerDigest},
 		}, nil
 	default:
 		return CoreTransition{}, fmt.Errorf("%w: got %q", ErrFinalizeRequiresTerminalState, authority.State)

@@ -36,6 +36,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -96,6 +97,8 @@ type NewLineageAuthority struct {
 	AdmittedFindingIDs    []string          `json:"admitted_finding_ids,omitempty"`
 	ReplayIdentity        string            `json:"replay_identity,omitempty"`
 	LastTransition        json.RawMessage   `json:"last_transition,omitempty"`
+
+	ProviderCausalAggregateDigest string `json:"provider_causal_aggregate_digest,omitempty"`
 	// CapturedResults is C-A's minimal capture primitive (Wave 5 fix cycle 2,
 	// coordinator decision: not a rebuilt v2-shaped admission pipeline --
 	// ArtifactSubject/FrozenCandidateContext/reopen machinery is Wave 7
@@ -104,6 +107,22 @@ type NewLineageAuthority struct {
 	// one-shot (no reopen), each bound to its own provider-owned subject hash
 	// and (C-E, fix cycle 3) its own validated findings.
 	CapturedResults []NewLineageCapturedResult `json:"captured_results,omitempty"`
+}
+
+func (result NewLineageCapturedResult) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Lens        string                 `json:"lens"`
+		Order       int                    `json:"order"`
+		SubjectHash string                 `json:"subject_hash"`
+		Findings    []FindingEvidence      `json:"findings,omitempty"`
+		Provider    *ProviderCausalCarrier `json:"provider_causal,omitempty"`
+	}
+	w := wire{Lens: result.Lens, Order: result.Order, SubjectHash: result.SubjectHash, Findings: result.Findings}
+	if result.Provider.SubjectHash != "" {
+		p := result.Provider
+		w.Provider = &p
+	}
+	return json.Marshal(w)
 }
 
 // NewLineageCapturedResult is one captured reviewer result's persisted
@@ -245,6 +264,9 @@ func (authority NewLineageAuthority) Validate() error {
 			}
 			if err := provider.Validate(); err != nil {
 				return fmt.Errorf("validate persisted provider carrier: %w", err)
+			}
+			if err := provider.ArtifactBinding.Validate(authority, captured.Lens, captured.Order, captured.SubjectHash); err != nil {
+				return fmt.Errorf("validate persisted provider artifact binding: %w", err)
 			}
 		}
 	}
@@ -477,7 +499,11 @@ func NewLineageReplayIdentity(lineageID string, state NewLineageState, candidate
 // ReviewCore's transition type — the storage layer never re-derives review
 // semantics from what it persists.
 func (authority *NewLineageAuthority) RecordTransition(requestDigest string, transition json.RawMessage) error {
-	identity, err := NewLineageReplayIdentity(authority.LineageID, authority.State, authority.CandidateIdentity, requestDigest)
+	replayDigest, err := authority.providerReplayDigest(requestDigest)
+	if err != nil {
+		return err
+	}
+	identity, err := NewLineageReplayIdentity(authority.LineageID, authority.State, authority.CandidateIdentity, replayDigest)
 	if err != nil {
 		return err
 	}
@@ -487,6 +513,14 @@ func (authority *NewLineageAuthority) RecordTransition(requestDigest string, tra
 	authority.ReplayIdentity = identity
 	authority.LastTransition = append(json.RawMessage(nil), transition...)
 	return nil
+}
+
+func (authority NewLineageAuthority) providerReplayDigest(requestDigest string) (string, error) {
+	aggregate := ProviderCausalAggregateDigest(authority)
+	if authority.ProviderCausalAggregateDigest != "" && authority.ProviderCausalAggregateDigest != aggregate {
+		return "", errors.New("new-lineage replay provider causal aggregate does not match captured carriers") // refusal:by-design operator-knowledge: persisted provider authority is contradictory and requires fresh capture
+	}
+	return requestDigest + "\x00provider-causal:" + aggregate, nil
 }
 
 // ErrOneCorrectionOnly is refused when a non-replay request arrives while
@@ -504,7 +538,11 @@ var ErrOneCorrectionOnly = errors.New("new-lineage authority already has one bou
 // not a replay, ResolveReplay refuses: the one-correction budget is already
 // spent.
 func (record NewLineageRecord) ResolveReplay(requestDigest string) (transition json.RawMessage, isReplay bool, err error) {
-	identity, err := NewLineageReplayIdentity(record.Authority.LineageID, record.Authority.State, record.Authority.CandidateIdentity, requestDigest)
+	replayDigest, err := record.Authority.providerReplayDigest(requestDigest)
+	if err != nil {
+		return nil, false, err
+	}
+	identity, err := NewLineageReplayIdentity(record.Authority.LineageID, record.Authority.State, record.Authority.CandidateIdentity, replayDigest)
 	if err != nil {
 		return nil, false, err
 	}
@@ -515,6 +553,69 @@ func (record NewLineageRecord) ResolveReplay(requestDigest string) (transition j
 		return nil, false, ErrOneCorrectionOnly
 	}
 	return nil, false, nil
+}
+
+func (authority NewLineageAuthority) ProviderCausalAdmission() ([]string, bool, error) {
+	return authority.providerCausalAdmission(true)
+}
+
+func (authority NewLineageAuthority) ProviderCausalAdmissionPartial() ([]string, bool, error) {
+	return authority.providerCausalAdmission(false)
+}
+
+func (authority NewLineageAuthority) providerCausalAdmission(requireAll bool) ([]string, bool, error) {
+	byLens := make(map[string]ProviderCausalCarrier, len(authority.CapturedResults))
+	selected := make(map[string]struct{}, len(authority.SelectedLenses))
+	for _, lens := range authority.SelectedLenses {
+		selected[lens] = struct{}{}
+	}
+	for _, captured := range authority.CapturedResults {
+		if _, ok := selected[captured.Lens]; !ok {
+			return nil, false, fmt.Errorf("%w for unselected lens %q", ErrProviderCausalCarrierConflict, captured.Lens)
+		}
+		if _, ok := byLens[captured.Lens]; ok {
+			return nil, false, fmt.Errorf("%w for duplicate lens %q", ErrProviderCausalCarrierConflict, captured.Lens)
+		}
+		if captured.Provider.SubjectHash == "" {
+			return nil, false, fmt.Errorf("%w for lens %q", ErrProviderCausalCarrierMissing, captured.Lens)
+		}
+		if err := captured.Provider.Validate(); err != nil {
+			return nil, false, fmt.Errorf("invalid provider causal carrier for lens %q: %w", captured.Lens, err)
+		}
+		if captured.Provider.SubjectHash != captured.SubjectHash || captured.Provider.CandidateIdentity != authority.CandidateIdentity {
+			return nil, false, fmt.Errorf("invalid provider causal carrier binding for lens %q", captured.Lens) // refusal:by-design world-action: an immutable provider carrier bound to a different frozen subject or candidate requires fresh capture
+		}
+		byLens[captured.Lens] = captured.Provider
+	}
+	findings := make(map[string]ProviderCausalFinding)
+	unknown := false
+	admitted := []string(nil)
+	for _, lens := range authority.SelectedLenses {
+		carrier, ok := byLens[lens]
+		if !ok {
+			if requireAll {
+				return nil, false, fmt.Errorf("%w for lens %q", ErrProviderCausalCarrierMissing, lens)
+			}
+			continue
+		}
+		for _, finding := range carrier.Findings {
+			if previous, ok := findings[finding.FindingID]; ok {
+				if previous.Classification != finding.Classification || previous.Location != finding.Location || !equalStrings(previous.ProofRefs, finding.ProofRefs) {
+					return nil, false, fmt.Errorf("%w for finding %q", ErrProviderCausalCarrierConflict, finding.FindingID)
+				}
+				continue
+			}
+			findings[finding.FindingID] = finding
+			switch finding.Classification {
+			case ProviderCandidateCausal:
+				admitted = append(admitted, finding.FindingID)
+			case ProviderUnknown:
+				unknown = true
+			}
+		}
+	}
+	sort.Strings(admitted)
+	return admitted, unknown, nil
 }
 
 // NewLineageReceipt is the exact review-receipt.json payload: the immutable

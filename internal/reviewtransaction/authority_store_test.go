@@ -17,6 +17,15 @@ import (
 // shadow_relation_test.go's fixtureCandidateIdentity (same package, same
 // real-Git-repo characterization suite) rather than a second candidate
 // identity fixture.
+func validProviderCarrier() ProviderCausalCarrier {
+	carrier := ProviderCausalCarrier{SubjectHash: "sha256:" + strings.Repeat("a", 64), Findings: []ProviderCausalFinding{{FindingID: "a", Location: "changed.go:3", ProofRefs: []string{"changed.go:3"}, Classification: ProviderCandidateCausal}, {FindingID: "b", Location: "same.go:3", ProofRefs: []string{"same.go:3"}, Classification: ProviderProvenNonCandidate}}}
+	for index := range carrier.Findings {
+		carrier.Findings[index].EvidenceDigest = providerFindingDigest(carrier.Findings[index])
+	}
+	carrier.AggregateDigest = providerAggregateDigest(carrier)
+	return carrier
+}
+
 func fixtureNewLineageAuthority(lineageID string, state NewLineageState) NewLineageAuthority {
 	return NewLineageAuthority{
 		LineageID:             lineageID,
@@ -135,8 +144,19 @@ func TestAuthorityStoreResolveReplayReturnsStoredTransitionWithoutMutation(t *te
 		t.Fatal(err)
 	}
 	transition := json.RawMessage(`{"kind":"continue"}`)
+	authority := fixtureNewLineageAuthority("replay-lineage", NewLineageStateReviewing)
+	authority.SelectedLenses = []string{"risk"}
+	carrier := validProviderCarrier()
+	carrier.CandidateIdentity = authority.CandidateIdentity
+	carrier.SubjectHash = NewLineageArtifactSubjectHash(authority, "risk", 0)
+	manifest := []ChangedPathManifestEntry{}
+	digest, _ := ChangedPathManifestDigest(manifest)
+	carrier.ArtifactBinding = NewLineageArtifactBinding{Subject: NewLineageArtifactSubject{Schema: "gentle-ai.new-lineage-artifact-subject/v1", SubjectHash: carrier.SubjectHash, LineageID: authority.LineageID, RepositoryID: authority.CandidateIdentity.RepositoryID, BaseTree: authority.CandidateIdentity.BaseTree, CandidateTree: authority.CandidateIdentity.CandidateTree, ChangedPathManifestSHA256: digest, Lens: "risk"}, Inspection: ArtifactInspection{Status: ArtifactInspectionCompleted}, Manifest: manifest}
+	carrier.AggregateDigest = providerAggregateDigest(carrier)
+	authority.CapturedResults = []NewLineageCapturedResult{{Lens: "risk", SubjectHash: carrier.SubjectHash, Provider: carrier}}
+	authority.ProviderCausalAggregateDigest = ProviderCausalAggregateDigest(authority)
 	revision, err := store.Mutate(context.Background(), "", func(next *NewLineageAuthority) error {
-		*next = fixtureNewLineageAuthority("replay-lineage", NewLineageStateReviewing)
+		*next = authority
 		return next.RecordTransition("request-digest-1", transition)
 	})
 	if err != nil {
@@ -179,6 +199,12 @@ func TestAuthorityStoreResolveReplayReturnsStoredTransitionWithoutMutation(t *te
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatal("ResolveReplay consumed budget: state artifact changed")
+	}
+	mutated := record
+	mutated.Authority.CapturedResults = append([]NewLineageCapturedResult(nil), record.Authority.CapturedResults...)
+	mutated.Authority.CapturedResults[0].Provider.AggregateDigest = "sha256:" + strings.Repeat("0", 64)
+	if _, _, err := mutated.ResolveReplay("request-digest-1"); err == nil {
+		t.Fatal("accepted replay after provider aggregate changed")
 	}
 
 	// A genuinely different request while NOT correcting is not a replay,

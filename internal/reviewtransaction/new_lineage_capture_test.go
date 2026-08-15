@@ -47,7 +47,7 @@ func newLineageCaptureFixtureStore(t *testing.T, lenses []string) (AuthorityStor
 // hasCapturedAllSelectedLenses via CapturedLensNames, satisfies the exact
 // check ReviewCore.finalize enforces (review_core.go:159) -- the check that
 // was permanently unsatisfiable before this fix.
-func TestCaptureLensResult_HappyPathThenFinalizeSatisfiesLensResults(t *testing.T) {
+func TestCaptureLensResultWithoutProviderEvidenceOmitsProviderCausalJSON(t *testing.T) {
 	store, record := newLineageCaptureFixtureStore(t, []string{"review-reliability"})
 	subject := NewLineageArtifactSubjectHash(record.Authority, "review-reliability", 0)
 
@@ -57,6 +57,9 @@ func TestCaptureLensResult_HappyPathThenFinalizeSatisfiesLensResults(t *testing.
 	}
 	if len(updated.Authority.CapturedResults) != 1 || updated.Authority.CapturedResults[0].Lens != "review-reliability" {
 		t.Fatalf("captured results = %#v", updated.Authority.CapturedResults)
+	}
+	if payload, err := json.Marshal(updated.Authority.CapturedResults[0]); err != nil || strings.Contains(string(payload), `"provider_causal"`) {
+		t.Fatalf("captured result JSON = %s, %v", payload, err)
 	}
 	if !hasCapturedAllSelectedLenses(updated.Authority.SelectedLenses, updated.Authority.CapturedLensNames()) {
 		t.Fatalf("hasCapturedAllSelectedLenses = false after capturing every selected lens: captured=%v selected=%v",
@@ -125,6 +128,16 @@ func TestCaptureLensResult_OneShotNoReopen(t *testing.T) {
 		differentSubject := NewLineageArtifactSubjectHash(first.Authority, "review-reliability-different-domain", 0)
 		if _, err := store.CaptureLensResult(context.Background(), first.Revision, "review-reliability", 0, differentSubject, nil); err == nil {
 			t.Fatal("recaptured an already-captured lens under a different subject hash; capture must be one-shot, no reopen")
+		}
+	})
+	t.Run("provider evidence is idempotent", func(t *testing.T) {
+		s, r := newLineageCaptureFixtureStore(t, []string{"review-reliability"})
+		first, err := s.CaptureLensResultWithProviderEvidence(context.Background(), r.Revision, "review-reliability", 0, NewLineageArtifactSubjectHash(r.Authority, "review-reliability", 0), nil)
+		if err != nil {
+			t.Fatalf("first provider capture: %v", err)
+		}
+		if again, err := s.CaptureLensResultWithProviderEvidence(context.Background(), first.Revision, "review-reliability", 0, NewLineageArtifactSubjectHash(first.Authority, "review-reliability", 0), nil); err != nil || again.Revision != first.Revision {
+			t.Fatalf("identical provider capture = (%q, %v), want revision %q", again.Revision, err, first.Revision)
 		}
 	})
 }

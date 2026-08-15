@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -225,7 +224,6 @@ func TestReviewCoreFinalizeAdvanceEscalatesOnFailedOrAdmittedFindings(t *testing
 		request FinalizeAdvanceRequest
 	}{
 		{"failed evidence", FinalizeAdvanceRequest{Failed: true}},
-		{"admitted candidate-causal finding", FinalizeAdvanceRequest{AdmittedFindingIDs: []string{"F-CAUSAL"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,10 +235,23 @@ func TestReviewCoreFinalizeAdvanceEscalatesOnFailedOrAdmittedFindings(t *testing
 			if transition.Kind != CoreTransitionEscalate || transition.Authority == nil || transition.Authority.State != NewLineageStateEscalated {
 				t.Fatalf("finalize(reviewing, %s) = %#v, want escalate with an escalated authority", tc.name, transition)
 			}
-			if len(tc.request.AdmittedFindingIDs) > 0 && !reflect.DeepEqual(transition.Authority.AdmittedFindingIDs, tc.request.AdmittedFindingIDs) {
-				t.Fatalf("finalize(reviewing, %s) admitted finding ids = %v, want %v", tc.name, transition.Authority.AdmittedFindingIDs, tc.request.AdmittedFindingIDs)
-			}
 		})
+	}
+}
+
+func TestReviewCoreFinalizeRejectsForgedIDsAndUsesProviderIDs(t *testing.T) {
+	a := fixtureNewLineageAuthority("provider-finalize-lineage", NewLineageStateReviewing)
+	if _, err := (ReviewCore{}).Next(context.Background(), a, CoreRequest{Kind: CoreRequestFinalize, AdvanceRequest: &FinalizeAdvanceRequest{AdmittedFindingIDs: []string{"forged"}}}); !errors.Is(err, ErrFinalizeRawAdmittedFindingIDs) {
+		t.Fatalf("forged IDs: %v", err)
+	}
+	a.SelectedLenses = []string{"risk"}
+	c := validProviderCarrier()
+	c.CandidateIdentity = a.CandidateIdentity
+	c.AggregateDigest = providerAggregateDigest(c)
+	a.CapturedResults = []NewLineageCapturedResult{{Lens: "risk", SubjectHash: c.SubjectHash, Provider: c}}
+	tr, err := (ReviewCore{}).Next(context.Background(), a, CoreRequest{Kind: CoreRequestFinalize, AdvanceRequest: &FinalizeAdvanceRequest{CapturedLensResults: []string{"risk"}}})
+	if err != nil || tr.Kind != CoreTransitionEscalate || len(tr.Authority.AdmittedFindingIDs) != 1 || tr.Authority.AdmittedFindingIDs[0] != "a" {
+		t.Fatalf("provider finalize = %#v, %v", tr, err)
 	}
 }
 

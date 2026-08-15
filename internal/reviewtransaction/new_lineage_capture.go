@@ -30,8 +30,86 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 )
+
+type NewLineageArtifactSubject struct {
+	Schema, SubjectHash, LineageID, RepositoryID, BaseTree, CandidateTree, ChangedPathManifestSHA256, Lens string
+	SelectedOrder                                                                                          int
+}
+type NewLineageArtifactBinding struct {
+	Subject    NewLineageArtifactSubject  `json:"subject"`
+	Inspection ArtifactInspection         `json:"inspection"`
+	Manifest   []ChangedPathManifestEntry `json:"manifest"`
+}
+
+func (b NewLineageArtifactBinding) Validate(a NewLineageAuthority, lens string, order int, subject string) error {
+	if b.Subject.Schema != "gentle-ai.new-lineage-artifact-subject/v1" || b.Subject.SubjectHash != subject || b.Subject.SubjectHash != NewLineageArtifactSubjectHash(a, lens, order) || b.Subject.LineageID != a.LineageID || b.Subject.RepositoryID != a.CandidateIdentity.RepositoryID || b.Subject.BaseTree != a.CandidateIdentity.BaseTree || b.Subject.CandidateTree != a.CandidateIdentity.CandidateTree || b.Subject.Lens != lens || b.Subject.SelectedOrder != order {
+		return errors.New("new-lineage artifact subject does not bind the frozen authority") // refusal:by-design world-action: immutable artifact identity requires fresh capture
+	}
+	if err := ValidateChangedPathManifest(b.Manifest); err != nil {
+		return fmt.Errorf("new-lineage artifact manifest is invalid: %w", err)
+	}
+	digest, err := ChangedPathManifestDigest(b.Manifest)
+	if err != nil || digest != b.Subject.ChangedPathManifestSHA256 {
+		return errors.New("new-lineage artifact subject manifest digest does not match") // refusal:by-design world-action: tampered manifest requires fresh capture
+	}
+	if b.Inspection.Status != ArtifactInspectionCompleted {
+		return errors.New("new-lineage artifact inspection is not completed") // refusal:by-design operator-knowledge: complete inspection is required
+	}
+	want := make([]string, len(b.Manifest))
+	for i, entry := range b.Manifest {
+		want[i] = entry.Path
+	}
+	paths, err := canonicalPaths(b.Inspection.Paths)
+	if err != nil || !equalStrings(paths, b.Inspection.Paths) || !equalStrings(paths, want) {
+		return errors.New("new-lineage artifact inspection does not cover the frozen manifest in order") // refusal:by-design operator-knowledge: fresh complete evidence is required
+	}
+	return nil
+}
+func NewLineageArtifactBindingForAuthority(ctx context.Context, repo string, a NewLineageAuthority, lens string, order int, inspection ArtifactInspection) (NewLineageArtifactBinding, error) {
+	if order < 0 || order >= len(a.SelectedLenses) || a.SelectedLenses[order] != lens {
+		return NewLineageArtifactBinding{}, ErrNewLineageCaptureLensNotSelected
+	}
+	manifest, err := NewLineageArtifactManifestForAuthority(ctx, repo, a)
+	if err != nil {
+		return NewLineageArtifactBinding{}, err
+	}
+	digest, err := ChangedPathManifestDigest(manifest)
+	if err != nil {
+		return NewLineageArtifactBinding{}, err
+	}
+	b := NewLineageArtifactBinding{Subject: NewLineageArtifactSubject{Schema: "gentle-ai.new-lineage-artifact-subject/v1", SubjectHash: NewLineageArtifactSubjectHash(a, lens, order), LineageID: a.LineageID, RepositoryID: a.CandidateIdentity.RepositoryID, BaseTree: a.CandidateIdentity.BaseTree, CandidateTree: a.CandidateIdentity.CandidateTree, ChangedPathManifestSHA256: digest, Lens: lens, SelectedOrder: order}, Inspection: inspection, Manifest: manifest}
+	if err := b.Validate(a, lens, order, b.Subject.SubjectHash); err != nil {
+		return NewLineageArtifactBinding{}, err
+	}
+	return b, nil
+}
+func NewLineageArtifactManifestForAuthority(ctx context.Context, repo string, a NewLineageAuthority) ([]ChangedPathManifestEntry, error) {
+	raw, err := runGitIsolated(ctx, repo, nil, nil, "diff", "--raw", "-z", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", a.CandidateIdentity.BaseTree, a.CandidateIdentity.CandidateTree, "--")
+	if err != nil {
+		return nil, fmt.Errorf("render frozen new-lineage manifest: %w", err)
+	}
+	modes, err := parseRawDiffModes(raw)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(modes))
+	for path := range modes {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	manifest := make([]ChangedPathManifestEntry, 0, len(paths))
+	for _, path := range paths {
+		d := modes[path]
+		manifest = append(manifest, ChangedPathManifestEntry{Path: path, Status: d.status, OldMode: d.oldMode, NewMode: d.newMode, Deleted: d.status == CandidatePathDeleted, TypeChanged: d.status == CandidatePathTypeChanged, ModeOnly: d.status == CandidatePathModified && d.oldObject == d.newObject && d.oldMode != d.newMode})
+	}
+	if err := ValidateChangedPathManifest(manifest); err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
 
 // NewLineageArtifactSubjectHash is C-A's minimal provider-owned binding: it
 // proves a reviewer result was computed against THIS exact frozen authority
@@ -119,6 +197,9 @@ func (store AuthorityStore) CaptureLensResult(ctx context.Context, expectedRevis
 			if carrier.SubjectHash != subjectHash || carrier.CandidateIdentity != next.CandidateIdentity || carrier.Validate() != nil {
 				return errors.New("provider causal carrier does not match capture binding") // refusal:by-design world-action: immutable provider evidence must remain bound to its frozen capture
 			}
+			if err := carrier.ArtifactBinding.Validate(*next, lens, order, subjectHash); err != nil {
+				return fmt.Errorf("validate provider causal artifact binding before persistence: %w", err)
+			}
 		}
 		for _, existing := range next.CapturedResults {
 			if existing.Lens != lens {
@@ -131,6 +212,9 @@ func (store AuthorityStore) CaptureLensResult(ctx context.Context, expectedRevis
 		}
 		result := NewLineageCapturedResult{Lens: lens, Order: order, SubjectHash: subjectHash, Findings: normalizedFindings, Provider: carrier}
 		next.CapturedResults = append(append([]NewLineageCapturedResult(nil), next.CapturedResults...), result)
+		if len(provider) > 0 {
+			next.ProviderCausalAggregateDigest = ProviderCausalAggregateDigest(*next)
+		}
 		return nil
 	}); err != nil {
 		return NewLineageRecord{}, err
@@ -147,6 +231,20 @@ func (store AuthorityStore) CaptureLensResultWithProviderEvidence(ctx context.Co
 	if err != nil {
 		return NewLineageRecord{}, err
 	}
+	manifest, err := NewLineageArtifactManifestForAuthority(ctx, store.repo, record.Authority)
+	if err != nil {
+		return NewLineageRecord{}, err
+	}
+	paths := make([]string, len(manifest))
+	for i, entry := range manifest {
+		paths[i] = entry.Path
+	}
+	binding, err := NewLineageArtifactBindingForAuthority(ctx, store.repo, record.Authority, lens, order, ArtifactInspection{Status: ArtifactInspectionCompleted, Paths: paths})
+	if err != nil {
+		return NewLineageRecord{}, err
+	}
+	carrier.ArtifactBinding = binding
+	carrier.AggregateDigest = providerAggregateDigest(carrier)
 	return store.CaptureLensResult(ctx, expectedRevision, lens, order, subjectHash, nil, carrier)
 }
 

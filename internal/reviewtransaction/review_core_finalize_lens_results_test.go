@@ -80,7 +80,13 @@ func TestReviewCoreFinalizeRefusesApprovalWithoutCapturedLensResults(t *testing.
 	})
 
 	t.Run("captured results covering the full frozen selection approves", func(t *testing.T) {
-		transition, err := (ReviewCore{}).Next(context.Background(), medium, CoreRequest{
+		ready := medium
+		carrier := validProviderCarrier()
+		carrier.Findings = carrier.Findings[1:]
+		carrier.CandidateIdentity = ready.CandidateIdentity
+		carrier.AggregateDigest = providerAggregateDigest(carrier)
+		ready.CapturedResults = []NewLineageCapturedResult{{Lens: LensReliability, SubjectHash: carrier.SubjectHash, Provider: carrier}}
+		transition, err := (ReviewCore{}).Next(context.Background(), ready, CoreRequest{
 			Kind: CoreRequestFinalize,
 			AdvanceRequest: &FinalizeAdvanceRequest{
 				CapturedLensResults: []string{LensReliability},

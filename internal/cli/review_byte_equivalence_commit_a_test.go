@@ -58,8 +58,10 @@ const byteEquivalenceCommitALineage = "byte-equivalence-commit-a-lineage"
 // switch-free under this same normalization; divergence in any
 // path-independent byte remains a defect signal, never a golden-update task.
 const byteEquivalenceCommitARevisionPlaceholder = "sha256:{{path-dependent-authority-revision}}"
+const byteEquivalenceCommitAProviderCausalAggregateDigestPlaceholder = "sha256:{{provider-causal-aggregate-digest}}"
 
 var byteEquivalenceCommitARevisionPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var byteEquivalenceCommitAProviderCausalAggregateDigestPattern = regexp.MustCompile(`"provider_causal_aggregate_digest": "sha256:[0-9a-f]{64}"`)
 
 // byteEquivalenceCommitAFixturePath is a fresh per-test directory. The
 // repository's absolute path feeds only the authority revision digest, which
@@ -239,6 +241,7 @@ func assertByteEquivalenceCommitAGolden(t *testing.T, path string, got []byte, r
 	if revision != "" {
 		normalized = bytes.ReplaceAll(normalized, []byte(revision), []byte(byteEquivalenceCommitARevisionPlaceholder))
 	}
+	normalized = []byte(byteEquivalenceCommitAProviderCausalAggregateDigestPattern.ReplaceAllString(string(normalized), `"provider_causal_aggregate_digest": "`+byteEquivalenceCommitAProviderCausalAggregateDigestPlaceholder+`"`))
 	if *updateReviewByteEquivalenceCommitAGolden {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)

@@ -39,7 +39,15 @@ type ProviderCausalCarrier struct {
 	CandidateIdentity CandidateIdentity       `json:"candidate_identity"`
 	Findings          []ProviderCausalFinding `json:"findings"`
 	AggregateDigest   string                  `json:"aggregate_digest"`
+
+	ArtifactBinding NewLineageArtifactBinding `json:"artifact_binding"`
 }
+
+var (
+	ErrProviderCausalCarrierMissing  = errors.New("new-lineage provider causal carrier is missing")                     // refusal:by-design operator-knowledge: missing persisted authority requires fresh capture
+	ErrProviderCausalCarrierConflict = errors.New("new-lineage provider causal classifications conflict across lenses") // refusal:by-design operator-knowledge: conflicting authority requires fresh capture
+)
+
 type ProviderCausalFailure struct {
 	Kind, Operation string
 	Cause           error
@@ -118,9 +126,22 @@ func providerAggregateDigest(c ProviderCausalCarrier) string {
 	for i, f := range c.Findings {
 		ids[i] = f.EvidenceDigest
 	}
-	b, _ := json.Marshal([]any{c.SubjectHash, c.CandidateIdentity, ids})
+	b, _ := json.Marshal([]any{c.SubjectHash, c.CandidateIdentity, c.ArtifactBinding, ids})
 	return fmt.Sprintf("sha256:%x", sha256.Sum256(append([]byte("gentle-ai.provider-causal-aggregate/v1\x00"), b...)))
 }
+func ProviderCausalAggregateDigest(a NewLineageAuthority) string {
+	parts := make([]string, 0, len(a.CapturedResults))
+	for _, captured := range a.CapturedResults {
+		if captured.Provider.SubjectHash != "" {
+			parts = append(parts, captured.Provider.AggregateDigest)
+		}
+	}
+	sort.Strings(parts)
+	b, _ := json.Marshal([]any{a.CandidateIdentity, parts})
+	sum := sha256.Sum256(append([]byte("gentle-ai.provider-causal-authority/v1\x00"), b...))
+	return fmt.Sprintf("sha256:%x", sum)
+}
+
 func DeriveProviderCausalCarrier(ctx context.Context, repo, subject string, candidate CandidateIdentity, claims []ProviderCausalEvidence) (ProviderCausalCarrier, error) {
 	if !validSHA256(subject) || !validGitTree(candidate.BaseTree) || !validGitTree(candidate.CandidateTree) {
 		return ProviderCausalCarrier{}, errors.New("provider causal derivation requires a valid subject and frozen candidate trees") // refusal:by-design world-action: caller-supplied frozen identity must be valid before derivation and cannot be repaired by an operator command

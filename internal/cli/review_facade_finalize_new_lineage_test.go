@@ -112,58 +112,48 @@ func TestReviewFacadeFinalizeNewLineageFailedEvidenceEscalates(t *testing.T) {
 	}
 }
 
-// TestReviewFacadeFinalizeNewLineageAdmitsOnlyCandidateCausalFindings is
-// task C2's CLI-level RED/GREEN evidence: a candidate-caused finding blocks
-// finalize (escalates rather than approves) and is the ONLY finding ID ever
-// persisted into review-state.json's admitted_finding_ids; the sibling
-// pre-existing finding never appears there (spec rdd-review-core-transitions,
-// "Candidate-Causal Admission Only", both scenarios).
 func TestReviewFacadeFinalizeNewLineageAdmitsOnlyCandidateCausalFindings(t *testing.T) {
 	reviewModeHome(t)
 	repo := initReviewCLIRepo(t)
 	const lineage = "finalize-admission-blocks-lineage"
-	startNewLineageForFinalizeTest(t, repo, lineage)
-
-	findingsPath := filepath.Join(t.TempDir(), "findings.json")
-	findings := []reviewtransaction.FindingEvidence{
-		{FindingID: "candidate-caused-finding", Class: reviewtransaction.EvidenceDeterministic, Causality: reviewtransaction.CausalIntroduced, Proof: "diff shows the introduced defect"},
-		{FindingID: "pre-existing-finding", Class: reviewtransaction.EvidenceDeterministic, Causality: reviewtransaction.CausalPreExisting, Proof: "present in the base tree"},
-	}
-	payload, err := json.Marshal(findings)
+	writeReviewStartCandidate(t, repo, "lib/"+lineage+".go", "package lib\n\nfunc Example() int { return 0 }\n", 0o644)
+	runReviewCLIGit(t, repo, "commit", "-m", "base candidate")
+	started := startMediumTierNewLineage(t, repo, lineage)
+	store, err := reviewtransaction.NewLineageAuthorityStore(context.Background(), repo, lineage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(findingsPath, payload, 0o644); err != nil {
-		t.Fatal(err)
+	record, found, err := reviewtransaction.DiscoverNewLineage(context.Background(), repo, lineage)
+	if err != nil || !found {
+		t.Fatalf("discover authority: %#v, %t, %v", record, found, err)
 	}
+	lens := started.SelectedLenses[0]
+	claims := []reviewtransaction.ProviderCausalEvidence{{FindingID: "candidate-caused-finding", Location: "lib/" + lineage + ".go:3", ProofRefs: []string{"lib/" + lineage + ".go:3"}}}
+	subject := reviewtransaction.NewLineageArtifactSubjectHash(record.Authority, lens, 0)
+	record, err = store.CaptureLensResultWithProviderEvidence(t.Context(), record.Revision, lens, 0, subject, claims)
+	if err != nil {
+		t.Fatalf("persist provider carrier: %v", err)
+	}
+	findings := []reviewtransaction.FindingEvidence{{FindingID: "caller-forged-finding", Class: reviewtransaction.EvidenceDeterministic, Causality: reviewtransaction.CausalIntroduced, Proof: "caller input"}}
 
 	var out bytes.Buffer
-	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", lineage, "--admission-findings", findingsPath}, &out); err != nil {
-		t.Fatalf("new-lineage finalize(admission findings) must still reach a receipt, got error: %v\n%s", err, out.String())
+	if err := runReviewFacadeFinalizeNewLineage(t.Context(), &out, repo, lineage, record, findings, false, true); err == nil || !strings.Contains(err.Error(), "provider-derived admitted finding IDs") {
+		t.Fatalf("caller IDs must not override persisted provider authority: %v\n%s", err, out.String())
+	}
+
+	out.Reset()
+	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", lineage, "--failed", "--captured-results=true"}, &out); err != nil {
+		t.Fatalf("finalize with persisted carrier: %v\n%s", err, out.String())
 	}
 	var result ReviewFacadeFinalizeNewLineageResult
 	decodeStrictReviewJSON(t, out.Bytes(), &result)
 	if result.State != reviewtransaction.NewLineageStateEscalated {
-		t.Fatalf("finalize with an admitted candidate-causal finding = %q, want escalated (blocked)", result.State)
+		t.Fatalf("finalize state = %q, want escalated", result.State)
 	}
 	if !reflect.DeepEqual(result.AdmittedFindingIDs, []string{"candidate-caused-finding"}) {
 		t.Fatalf("admitted_finding_ids = %v, want exactly [candidate-caused-finding]", result.AdmittedFindingIDs)
 	}
 
-	store, err := reviewtransaction.NewLineageAuthorityStore(context.Background(), repo, lineage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(store.StatePath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "pre-existing-finding") {
-		t.Fatalf("pre-existing (follow-up) finding must never be persisted into review-state.json's admitted set: %s", raw)
-	}
-	if !strings.Contains(string(raw), "candidate-caused-finding") {
-		t.Fatalf("candidate-causal finding must be persisted: %s", raw)
-	}
 }
 
 // TestReviewFacadeFinalizeNewLineageFollowUpFindingsDoNotBlock is the

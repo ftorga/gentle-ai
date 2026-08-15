@@ -6,6 +6,8 @@
 // — is readable without the consent/tier/replay decision tree around it.
 package reviewtransaction
 
+import "errors"
+
 // CoreRequestKind names which of ReviewCore's three owned operations a
 // CoreRequest describes (spec rdd-review-core-transitions, "Sole Transition
 // Owner for New Lineages": only start, finalize, or validate exist).
@@ -48,6 +50,8 @@ type CoreInput struct {
 type ReceiptRef struct {
 	LineageID         string `json:"lineage_id"`
 	AuthorityRevision string `json:"authority_revision"`
+
+	ProviderCausalAggregateDigest string `json:"provider_causal_aggregate_digest,omitempty"`
 }
 
 // CoreTransition is Next's exact return shape (design's literal Interfaces /
@@ -136,6 +140,9 @@ type FinalizeAdvanceRequest struct {
 	AdmittedFindingIDs  []string
 	CapturedLensResults []string
 }
+
+// refusal:by-design operator-knowledge: raw caller finding IDs cannot substitute provider-derived authority
+var ErrFinalizeRawAdmittedFindingIDs = errors.New("finalize requires provider-derived admitted finding IDs")
 
 // CoreValidateEvidence carries every already-resolved input relateCandidates
 // needs beyond the frozen/live CandidateIdentity pair: Snapshot boundaries,
